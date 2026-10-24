@@ -10,7 +10,7 @@ depends=('python')
 optdepends=('python-pyzipper: AES-encrypted ZIP inspection (--password)')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 checkdepends=('python-hypothesis' 'python-pytest')
-source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/d2/54/7001369097ca7fe95f33bede8f65d098042987faa88635cb149a69a439d0/$pkgname-$pkgver.tar.gz")
 sha256sums=('625e622023cea78ac5e206b690bf2555ba2b50b783c5eaa7d3a0a700e77c21c4')
 
 build() {
