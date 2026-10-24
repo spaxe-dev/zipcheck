@@ -4,6 +4,67 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-10-24
+
+### Added
+
+- `INSPECTION_INCOMPLETE` (MEDIUM): static nested inspection was incomplete, so
+  the file is reported `unknown` instead of `clean`.
+- `ISIZE_UNDERSTATED` (LOW): bounded gzip decompression measured more output
+  than the final member's `ISIZE` trailer declares.
+- gzip streams are measured across all concatenated members by a bounded probe
+  by default; `--probe-limit` now applies to gzip as well as bzip2/size-less
+  formats.
+- Static ZIP stream-tail probe: when a member's declared data ends before the
+  next structure, up to 64 KiB of its declared compressed bytes is decoded and
+  checked for termination at the declared size (256 members and 4 MiB of total
+  output per archive). A stream that does not end at the declared compressed
+  size yields `UNDERSTATED_COMPRESSED_SIZE` (HIGH); output beyond the declared
+  size yields `METADATA_UNDERSTATED` (HIGH). This catches crude
+  forged-size ZIPs and forged bombs nested in complete images under gzip,
+  bzip2, xz, split gzip and ZIP-LZMA members without `--verify`.
+
+### Changed
+
+- Static nested inspection fails closed. Hitting the depth, candidate,
+  archive-count or byte budget while unexamined archive-like members remain,
+  reading only a truncated member prefix, receiving an unknown child scan, or
+  encountering an archive-like 7z/RAR/encrypted member now yields `unknown`
+  with `INSPECTION_INCOMPLETE` instead of a misleading `clean`.
+- The per-archive nested candidate limit is 128 (was 32), so a bomb placed
+  behind many decoy archives is inspected rather than silently skipped.
+- Encrypted archive-like members are `unknown` statically instead of merely
+  `suspicious`.
+
+### Fixed
+
+- A readable member named like an archive (for example plain text in
+  `notes.zip`) is no longer treated as a nested archive. Extension fallback is
+  now limited to formats with weak or optional magic (tar, LZMA); ZIP-like
+  members require an actual signature inside the captured prefix. This removes
+  false `INSPECTION_INCOMPLETE`/`UNVERIFIED` results.
+- The nested prefix examination cap was 1024 members, which marked large benign
+  archives `unknown` under `--require-verified` even after every member was
+  verified. It is now aligned with the 100,000-entry parse cap; the separate
+  128-candidate/128-archive caps still bound real nested inspection.
+- gzip `ISIZE` handling: the trailer covers only the final member modulo 2³².
+  A forged trailer used to make the probe fail with no measurement, and
+  multi-member or wrapped streams could scan clean. Every member is now counted;
+  capped probes are `unknown`, and a larger honest `ISIZE` is retained as a
+  lower-bound estimate.
+- The gzip probe uses raw zlib with deadline checks and bounded output slices,
+  so a malformed later-member header cannot stall inside the standard library
+  and a trailer error cannot discard all previously measured output.
+- 7z/RAR archive-like member names are detected, so opaque nested archives fail
+  closed instead of being skipped.
+- A 7-level nested chain no longer scans `clean` when the depth limit truncates
+  inspection.
+
+[Unreleased]: https://github.com/spaxe-dev/zipcheck/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/spaxe-dev/zipcheck/releases/tag/v0.2.0
+
 ## [0.1.0] - 2026-10-24
 
 First public release.

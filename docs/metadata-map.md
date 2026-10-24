@@ -2,6 +2,7 @@
 
 This is the byte-level companion to the README. `zipcheck` reads these fields
 directly; it does not decompress an archive to learn how large it will become.
+Static decompression is limited to small bounded consistency probes.
 
 All offsets are decimal bytes from the start of the relevant structure unless
 stated otherwise. Multi-byte integers are little-endian unless noted.
@@ -86,6 +87,20 @@ A related giveaway: DEFLATE's maximum theoretical expansion is about
 **1032:1**. A declared ratio beyond that cannot be produced by ordinary DEFLATE
 and implies overlap or a lying directory.
 
+### Forged compressed sizes and the tail probe
+
+Both copies of a size can be forged consistently, so the ratio arithmetic sees
+an innocent 1:1 member. One static signal remains: layout. If the declared data
+range ends before the next local header or the central directory, the bytes in
+between are unexplained. zipcheck decodes at most 64 KiB of that member's
+declared compressed bytes (256 members and 4 MiB of total output per archive)
+and asks whether the stream ends at the declared compressed size. If it does
+not, the result is `UNDERSTATED_COMPRESSED_SIZE` (HIGH). Output larger than the
+declared `usize` produces `METADATA_UNDERSTATED` (HIGH). This catches the crude
+forged-size class without decompressing normal archives. A forgery arranged to
+look contiguous, or one outside the probe caps, remains invisible until
+`--verify`.
+
 ---
 
 ## TAR
@@ -144,11 +159,14 @@ The last 8 bytes of a member are:
 
 So a 1 GiB zero file can be recognised from its final four bytes
 (`00 00 00 40`) without decompressing anything. `ISIZE` is ambiguous for exact
-multiples of 4 GiB, which is why `zipcheck` probes when it reads zero.
+multiples of 4 GiB and describes only the final member, so `zipcheck` counts
+every concatenated member with a bounded probe (64 MiB cap).
 
 Multiple gzip members can be concatenated; each has its own trailer. Only the
-final member's `ISIZE` is visible by looking at the end of the file, which is a
-documented limitation.
+final member's `ISIZE` is visible at the end of the file, which is why a
+metadata-only reading can understate the output arbitrarily. If the probe
+reaches its cap the result is `unknown`; if the measured total exceeds the
+trailer, `ISIZE_UNDERSTATED` (LOW) is reported.
 
 ---
 

@@ -22,7 +22,10 @@ class Limits:
 
     # --- nested archive inspection limits ---
     max_depth: int = 6
-    max_nested_candidates: int = 32
+    max_nested_candidates: int = 128
+    # Prefix examinations are cheap, so this is effectively aligned with the
+    # entry parse cap; the candidate caps above still bound real inspection.
+    max_nested_examined: int = 100_000
     max_nested_archives: int = 128
     max_nested_compressed: int = 8 * 1024 * 1024
     nested_prefix_bytes: int = 1024 * 1024
@@ -30,9 +33,16 @@ class Limits:
     nested_budget_bytes: int = 64 * 1024 * 1024
     max_decoder_memory: int = 128 * 1024 * 1024
 
-    # --- bounded decompression probe (only formats with no declared size) ---
+    # --- bounded decompression probe (size-less formats and ZIP tails) ---
     probe: bool = True
     probe_limit: int = 64 * 1024 * 1024
+    # Static ZIP tail check: probe members whose data leaves an unexplained
+    # gap before the next structure.  Bounded so a normal static scan never
+    # decompresses a whole archive.
+    stream_probe_max_entries: int = 256
+    stream_probe_max_compressed: int = 64 * 1024
+    stream_probe_max_output: int = 1024 * 1024
+    stream_probe_total_output: int = 4 * 1024 * 1024
 
     # --- content verification: actually decompress into a counting sink ---
     verify: bool = False

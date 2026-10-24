@@ -92,13 +92,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-probe",
         dest="probe",
         action="store_false",
-        help="do not run bounded decompression on bzip2 / size-less formats",
+        help=(
+            "do not run bounded decompression for gzip, bzip2, size-less "
+            "formats or ZIP stream-tail consistency checks"
+        ),
     )
     parser.add_argument(
         "--probe-limit",
         type=_parse_size,
         default=64 * 1024 * 1024,
-        help="maximum bytes produced by a bounded probe (default: 64MiB)",
+        help=(
+            "maximum bytes produced by a bounded probe per file "
+            "(default: 64MiB; applies to gzip and size-less formats)"
+        ),
     )
     parser.add_argument(
         "--verify",

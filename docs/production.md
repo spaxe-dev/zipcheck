@@ -22,8 +22,11 @@ With static analysis only:
 
 - ✅ recognises huge declared expansion, overlap/quine tricks, sparse TAR,
   entry-count bombs and shallow nesting;
-- ❌ **cannot** detect a ZIP whose central directory says `1 byte` while its
-  deflate stream expands to 10 GiB;
+- ✅ catches a forged compressed size when the real stream sits in an
+  unexplained gap after the declared data (bounded stream-tail probe), including
+  inside complete nested images;
+- ❌ **cannot** detect a ZIP whose forged stream is arranged to look contiguous,
+  or whose declared sizes exceed the stream-tail probe caps;
 - ❌ cannot inspect AES/ZipCrypto payloads;
 - ❌ cannot inspect 7z/RAR data without a decoder.
 
@@ -203,7 +206,7 @@ p99 scan durations. A sudden increase in `unknown` is a signal, not noise.
 |---|---|---|---|
 | ZIP/ZIP64 | yes | deflate, stored, bzip2, lzma + nested images (≤8 MiB) | reject AES/ZipCrypto unless decrypted in worker |
 | TAR | yes | declared plan + nested members (≤8 MiB) | sparse holes need filesystem quota; reject devices/symlinks |
-| gzip | yes | all members + nested images (≤8 MiB) | multi-member legal, but `METADATA_UNDERSTATED` marks it unverified |
+| gzip | probe | all members + nested images (≤8 MiB) | bounded probe counts every member; forged or truncated trailers fail closed |
 | bzip2 | probe | yes | exact size measured |
 | xz/LZMA | yes | first stream | concatenated streams are not fully verified |
 | Zstandard | header | no | requires `--require-verified` rejection or an external decoder |

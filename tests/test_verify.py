@@ -60,18 +60,24 @@ def test_understated_zip_is_dangerous_only_with_verification(tmp_path):
     assert "METADATA_UNDERSTATED" in {f.code for f in verified.findings}
 
 
-def test_understated_gzip_is_unverified(tmp_path):
+def test_understated_gzip_no_longer_scans_clean(tmp_path):
     path = tmp_path / "bomb.gz"
     with gzip.open(path, "wb", compresslevel=9) as handle:
         handle.write(b"\0" * (32 * 1024 * 1024))
     _understate_gzip(path)
     static = scan_file(str(path))
-    assert static.verdict == "clean"
+    assert static.verdict == "unknown"
+    # zlib drops the output slice that hits the forged trailer, so the static
+    # measurement is a lower bound within one probe slice of the real size.
+    assert static.declared_uncompressed is not None
+    assert static.declared_uncompressed >= 31 * 1024 * 1024
 
     verified = scan_file(str(path), Limits(verify=True, verify_limit=64 * 1024 * 1024))
     assert verified.verified is False
     assert verified.verified_uncompressed == 32 * 1024 * 1024
-    assert "METADATA_UNDERSTATED" in {f.code for f in verified.findings}
+    # The static probe already measured the real size, so verification now
+    # fails on the forged trailer rather than on a declared-size mismatch.
+    assert "UNVERIFIED" in {f.code for f in verified.findings}
 
 
 def test_verification_limit_is_dangerous(tmp_path):
@@ -108,7 +114,8 @@ def test_require_verified_accepts_clean_zip(tmp_path):
 def test_understated_compressed_size_is_dangerous(tmp_path):
     path = build_forged_bomb_zip(tmp_path / "forged.zip")
     static = scan_file(str(path))
-    assert static.verdict == "clean", "forged sizes hide the stream from metadata"
+    assert static.verdict == "dangerous"
+    assert "UNDERSTATED_COMPRESSED_SIZE" in {f.code for f in static.findings}
 
     verified = scan_file(str(path), Limits(verify=True))
     codes = {f.code for f in verified.findings}
@@ -129,7 +136,8 @@ def test_verify_only_flags_unverifiable_encrypted_archive(tmp_path):
 def test_verify_detects_forged_nested_zip_bomb(tmp_path):
     path = build_nested_forged_bomb_zip(tmp_path / "outer.zip")
     static = scan_file(str(path))
-    assert static.verdict == "clean", "inner metadata is forged to look harmless"
+    assert static.verdict == "dangerous"
+    assert "NESTED_BOMB" in {f.code for f in static.findings}
 
     verified = scan_file(str(path), Limits(verify=True))
     codes = {f.code for f in verified.findings}
@@ -141,7 +149,8 @@ def test_verify_detects_forged_nested_zip_bomb(tmp_path):
 def test_verify_detects_forged_bomb_in_gzip(tmp_path):
     path = build_gzip_with_nested_bomb(tmp_path / "outer.gz")
     static = scan_file(str(path))
-    assert static.verdict == "clean"
+    assert static.verdict == "dangerous"
+    assert "NESTED_BOMB" in {f.code for f in static.findings}
 
     verified = scan_file(str(path), Limits(verify=True))
     codes = {f.code for f in verified.findings}
@@ -152,7 +161,8 @@ def test_verify_detects_forged_bomb_in_gzip(tmp_path):
 def test_verify_detects_bomb_split_across_gzip_members(tmp_path):
     path = build_split_gzip_with_nested_bomb(tmp_path / "split.gz")
     static = scan_file(str(path))
-    assert static.verdict == "clean", "the bomb starts mid-stream and looks inert"
+    assert static.verdict == "dangerous"
+    assert "NESTED_BOMB" in {f.code for f in static.findings}
 
     verified = scan_file(str(path), Limits(verify=True))
     codes = {f.code for f in verified.findings}
@@ -178,7 +188,8 @@ def test_verify_detects_forged_bomb_in_zip_lzma_member(tmp_path):
     with zipfile.ZipFile(outer, "w", zipfile.ZIP_LZMA) as zf:
         zf.writestr("inner.zip", inner.read_bytes())
     static = scan_file(str(outer))
-    assert static.verdict == "clean", "inner metadata is forged to look harmless"
+    assert static.verdict == "dangerous"
+    assert "NESTED_BOMB" in {f.code for f in static.findings}
 
     verified = scan_file(str(outer), Limits(verify=True))
     codes = {f.code for f in verified.findings}

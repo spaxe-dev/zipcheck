@@ -114,12 +114,37 @@ def test_deep_nested_zip_bomb(tmp_path):
     assert "NESTED_BOMB" in {f.code for f in result.findings}
 
 
-def test_zip_depth_limit(tmp_path):
+def test_zip_depth_limit_fails_closed(tmp_path):
     inner = build_single_entry_zip(tmp_path / "inner.zip", usize=3 * 1024**3)
     outer = make_zip(tmp_path / "outer.zip", {"inner.zip": inner.read_bytes()})
     result = scan_file(str(outer), Limits(max_depth=0))
-    assert result.verdict == "clean"
+    assert result.verdict == "unknown"
+    assert result.unknown is True
+    assert "INSPECTION_INCOMPLETE" in {f.code for f in result.findings}
     assert any("depth" in note.lower() for note in result.notes)
+
+
+def test_late_nested_candidate_is_inspected(tmp_path):
+    bomb = build_single_entry_zip(tmp_path / "bomb.zip", usize=3 * 1024**3)
+    benign = make_zip(tmp_path / "benign.zip", {"a.txt": b"a"}).read_bytes()
+    members = {f"{index:02d}-benign.zip": benign for index in range(32)}
+    members["zz-bomb.zip"] = bomb.read_bytes()
+    outer = make_zip(tmp_path / "outer.zip", members, method=zipfile.ZIP_STORED)
+    result = scan_file(str(outer))
+    codes = {f.code for f in result.findings}
+    assert result.verdict == "dangerous"
+    assert "NESTED_BOMB" in codes
+
+
+def test_candidate_cap_fails_closed_when_bombs_remain(tmp_path):
+    bomb = build_single_entry_zip(tmp_path / "bomb.zip", usize=3 * 1024**3)
+    benign = make_zip(tmp_path / "benign.zip", {"a.txt": b"a"}).read_bytes()
+    members = {f"{index:03d}-benign.zip": benign for index in range(128)}
+    members["zz-bomb.zip"] = bomb.read_bytes()
+    outer = make_zip(tmp_path / "outer.zip", members, method=zipfile.ZIP_STORED)
+    result = scan_file(str(outer))
+    assert result.verdict == "unknown"
+    assert "INSPECTION_INCOMPLETE" in {f.code for f in result.findings}
 
 
 def test_empty_zip_is_clean(tmp_path):
@@ -131,11 +156,37 @@ def test_empty_zip_is_clean(tmp_path):
     assert result.entry_count == 0
 
 
-def test_encrypted_nested_archive_is_suspicious(tmp_path):
+def test_encrypted_nested_archive_is_unknown_statically(tmp_path):
     path = build_encrypted_archive_member_zip(tmp_path / "encrypted.zip")
     result = scan_file(str(path))
-    assert result.verdict == "suspicious"
-    assert "ENCRYPTED_NESTED_ARCHIVE" in {f.code for f in result.findings}
+    codes = {f.code for f in result.findings}
+    assert result.verdict == "unknown"
+    assert "ENCRYPTED_NESTED_ARCHIVE" in codes
+    assert "INSPECTION_INCOMPLETE" in codes
+
+
+def test_text_member_named_zip_is_not_a_nested_archive(tmp_path):
+    path = make_zip(
+        tmp_path / "outer.zip",
+        {"notes.zip": b"plain text, not an archive\n"},
+        method=zipfile.ZIP_STORED,
+    )
+    static = scan_file(str(path))
+    assert static.verdict == "clean"
+    assert not static.nested
+
+    verified = scan_file(str(path), Limits(verify=True, require_verified=True))
+    assert verified.verdict == "clean"
+    assert verified.verified is True
+
+
+def test_many_small_members_verify_clean(tmp_path):
+    members = {f"f{index:04d}.txt": b"x" for index in range(2000)}
+    path = make_zip(tmp_path / "many.zip", members, method=zipfile.ZIP_STORED)
+    result = scan_file(str(path), Limits(verify=True, require_verified=True))
+    assert result.verdict == "clean"
+    assert result.verified is True
+    assert not result.nested_unverified
 
 
 def test_directory_entry_is_ignored_for_ratio(tmp_path):

@@ -13,6 +13,7 @@ import zlib
 from dataclasses import dataclass, field
 from typing import BinaryIO, List, Tuple
 
+from .. import detect
 from ..limits import Limits
 from ..model import Facts, Finding, Severity
 from ..reader import ByteReader, Deadline, FormatError, read_at, u32le, u64le
@@ -353,7 +354,10 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
     elif header[:1] != bytes([K_HEADER]):
         raise FormatError("unknown 7z header type")
 
-    main, num_files, _names, complete = _parse_header(header, limits)
+    main, num_files, names, complete = _parse_header(header, limits)
+    nested_names = [
+        name for name in names if detect.extension_suggests_archive(name)
+    ][:10]
     declared = sum(f.final_size for f in main.folders)
     compressed = sum(main.pack_sizes)
     encrypted = any(
@@ -379,4 +383,5 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
         notes=notes,
         complete=complete,
         encrypted=encrypted,
+        nested_archive_names=nested_names,
     )

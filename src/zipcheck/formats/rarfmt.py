@@ -9,6 +9,7 @@ from __future__ import annotations
 import zlib
 from typing import BinaryIO, List, Tuple
 
+from .. import detect
 from ..limits import Limits
 from ..model import Facts, Finding
 from ..reader import ByteReader, Deadline, FormatError, read_at, u16le, u32le
@@ -63,6 +64,7 @@ def _scan_rar5(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
     unknown_size = False
     notes: List[str] = []
     findings: List[Finding] = []
+    nested_names: List[str] = []
     complete = True
 
     while pos + 8 <= size:
@@ -121,7 +123,7 @@ def _scan_rar5(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
                 r.vint()  # compression info
                 r.vint()  # host OS
                 name_size = r.vint()
-                r.take(name_size)  # member name; not needed for size totals
+                name = r.take(name_size).decode("utf-8", "replace")
             except FormatError:
                 notes.append("malformed RAR5 file header; stopping")
                 complete = False
@@ -133,6 +135,8 @@ def _scan_rar5(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
                 entries += 1
                 total_usize += unp_size
                 total_packed += data_size
+                if detect.extension_suggests_archive(name):
+                    nested_names.append(name)
             # File encryption is recorded in the extra area.
             if extra_size:
                 extra_start = max(0, len(header) - extra_size)
@@ -191,6 +195,7 @@ def _scan_rar5(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
         complete=complete,
         encrypted=encrypted,
         unknown=unknown_size,
+        nested_archive_names=nested_names[:10],
     )
 
 
@@ -200,6 +205,7 @@ def _scan_rar4(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
     headers = 0
     encrypted = False
     notes: List[str] = []
+    nested_names: List[str] = []
     complete = True
 
     while pos + 7 <= size:
@@ -247,7 +253,8 @@ def _scan_rar4(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
             entries += 1
             total_usize += unp_size
             total_packed += pack_size
-            del name
+            if detect.extension_suggests_archive(name):
+                nested_names.append(name)
         elif block_type == RAR4_END:
             break
         if head_size + add_size <= 0:
@@ -268,6 +275,7 @@ def _scan_rar4(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
         notes=notes,
         complete=complete,
         encrypted=encrypted,
+        nested_archive_names=nested_names[:10],
     )
 
 

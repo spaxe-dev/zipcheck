@@ -25,6 +25,7 @@ from ..reader import (
     u16le,
     u64le,
 )
+from ..verify import count_zip_entry
 
 EOCD_SIG = b"PK\x05\x06"
 ZIP64_EOCD_SIG = b"PK\x06\x06"
@@ -206,6 +207,7 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
     entries: List[EntryInfo] = []
     data_ranges: List[Tuple[int, int, str]] = []
     local_offsets: dict = {}
+    structural_starts: List[int] = []
     header_mismatches: List[dict] = []
     high_risk_mismatch = False
     total_usize = 0
@@ -283,6 +285,7 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
             complete = False
         else:
             data_offset = local.data_offset
+            structural_starts.append(adjusted_local)
             if local.usize is None or local.csize is None:
                 notes.append(f"entry {name!r} has unresolved ZIP64 local sizes")
                 complete = False
@@ -518,6 +521,18 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
             )
         )
 
+    _probe_stream_tails(
+        fp,
+        size,
+        entries,
+        structural_starts,
+        cd_start,
+        limits,
+        deadline,
+        findings,
+        notes,
+    )
+
     if lzma_entries and limits.max_depth:
         notes.append(
             f"{lzma_entries} LZMA-compressed ZIP member(s) are not recursively inspected"
@@ -573,6 +588,114 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
         complete=complete,
         encrypted=encrypted > 0,
     )
+
+
+def _probe_stream_tails(
+    fp: BinaryIO,
+    size: int,
+    entries: List[EntryInfo],
+    structural_starts: List[int],
+    cd_start: int,
+    limits: Limits,
+    deadline: Deadline,
+    findings: List[Finding],
+    notes: List[str],
+) -> None:
+    """Check that member streams end where the central directory says.
+
+    A forged compressed size can be internally consistent (both headers agree)
+    and leave the real stream in an *unclaimed gap* before the next structure.
+    Probing only those gaps keeps static scans from decompressing normal
+    archives while still exposing the crude forged-size class.
+    """
+
+    if not limits.probe or limits.verify:
+        return
+    starts = sorted(set(structural_starts))
+    if cd_start > 0:
+        starts.append(cd_start)
+        starts.sort()
+
+    probes = 0
+    output_left = limits.stream_probe_total_output
+    cap_hit = False
+    under_compressed: List[str] = []
+    under_output: List[Tuple[str, int, int]] = []
+
+    for entry in entries:
+        if entry.is_dir or entry.encrypted or entry.data_offset is None:
+            continue
+        if entry.csize is None or entry.usize is None:
+            continue
+        if entry.method not in ("deflate", "bzip2", "lzma"):
+            continue
+        if entry.csize <= 0 or entry.csize > limits.stream_probe_max_compressed:
+            continue
+        end = entry.data_offset + entry.csize
+        if end > size:
+            continue
+        boundary = next((start for start in starts if start >= end), size)
+        if boundary <= end:
+            continue
+        if entry.usize + 1 > limits.stream_probe_max_output:
+            continue
+        if entry.usize + 1 > output_left:
+            cap_hit = True
+            break
+        if probes >= limits.stream_probe_max_entries:
+            cap_hit = True
+            break
+        deadline.check()
+        probes += 1
+        counted = count_zip_entry(
+            fp, size, entry, entry.usize + 1, limits, deadline
+        )
+        output_left -= counted.total
+        if counted.error:
+            continue
+        if counted.total > entry.usize:
+            under_output.append((entry.name, entry.usize, counted.total))
+        elif not counted.eof and counted.fed >= entry.csize:
+            under_compressed.append(entry.name)
+
+    if under_compressed:
+        findings.append(
+            Finding(
+                code="UNDERSTATED_COMPRESSED_SIZE",
+                severity=Severity.HIGH,
+                title="Member stream continues past its declared compressed size",
+                detail=(
+                    f"{len(under_compressed)} member(s) have compressed streams "
+                    "that do not end at the size in the central directory. An "
+                    "extractor that reads to stream end consumes data the "
+                    "metadata hides."
+                ),
+                evidence={"members": under_compressed[:5]},
+            )
+        )
+    if under_output:
+        samples = [
+            {"name": name, "declared": declared, "actual_at_least": actual}
+            for name, declared, actual in under_output[:5]
+        ]
+        findings.append(
+            Finding(
+                code="METADATA_UNDERSTATED",
+                severity=Severity.HIGH,
+                title="Member data exceeds its declared size",
+                detail=(
+                    f"{len(under_output)} member(s) produced more output than the "
+                    "central directory declares during a bounded static probe. "
+                    "Extraction tools may write the real data, not the declared "
+                    "size."
+                ),
+                evidence={"samples": samples},
+            )
+        )
+    if cap_hit:
+        notes.append(
+            "bounded stream-tail probe limit reached; later members were not probed"
+        )
 
 
 def _find_zip64_eocd(fp: BinaryIO, eocd_pos: int, size: int) -> Optional[int]:

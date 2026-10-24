@@ -102,7 +102,11 @@ class Facts:
     measured: bool = False
     probe_capped: bool = False
     probe_input: Optional[int] = None
+    probe_output: Optional[int] = None
     sparse_total: int = 0
+    # Member names that look like nested archives but belong to a format whose
+    # data cannot be inspected without a decoder (7z, RAR).
+    nested_archive_names: List[str] = field(default_factory=list)
 
 
 @dataclass

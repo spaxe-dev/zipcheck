@@ -119,7 +119,7 @@ def _verify_zip(
         if remaining <= 0:
             capped = True
             break
-        counted = _count_zip_entry(
+        counted = count_zip_entry(
             fp, size, entry, remaining, limits, deadline
         )
         total += counted.total
@@ -270,7 +270,7 @@ class CountResult:
     unused_compressed: int = 0
 
 
-def _count_zip_entry(
+def count_zip_entry(
     fp: BinaryIO,
     size: int,
     entry,

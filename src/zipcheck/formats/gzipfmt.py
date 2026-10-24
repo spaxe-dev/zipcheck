@@ -1,18 +1,20 @@
 """gzip member metadata.
 
 gzip stores the uncompressed size in the last four bytes of each member
-(``ISIZE``), modulo 2^32.  Reading it requires no decompression at all.  The
-value is ambiguous when the real size is an exact multiple of 4 GiB, so that
-case falls back to a bounded probe.
+(``ISIZE``), modulo 2^32.  That covers only the *final* member: concatenated
+members are legal, and a stream can expand past 4 GiB so the trailer wraps.
+Both cases hide real output from a metadata-only scan, so a bounded
+multi-member probe is always run (unless probing is disabled).  The probe
+counts bytes in memory and never writes output.
 """
 
 from __future__ import annotations
 
 import zlib
-from typing import BinaryIO, List, Optional
+from typing import BinaryIO, List, Optional, Tuple
 
 from ..limits import Limits
-from ..model import Facts
+from ..model import Facts, Finding, Severity
 from ..reader import Deadline, FormatError, read_at, u16le, u32le
 
 FHCRC = 0x02
@@ -22,6 +24,11 @@ FCOMMENT = 0x10
 FRESERVED = 0xE0
 
 MAGIC = b"\x1f\x8b"
+
+# zlib discards the output buffer of a call that ends in a trailer error, so
+# decode in slices: at most this much valid output is lost when a forged
+# trailer makes the final call fail.
+PROBE_SLICE = 1024 * 1024
 
 
 def _header(fp: BinaryIO, size: int, limits: Limits) -> tuple:
@@ -61,6 +68,73 @@ def _header(fp: BinaryIO, size: int, limits: Limits) -> tuple:
     return flags, name, notes
 
 
+def _probe_total(
+    fp: BinaryIO, cap: int, deadline: Deadline
+) -> Tuple[int, int, bool, Optional[str]]:
+    """Measure the output of every concatenated member, capped at ``cap``.
+
+    Returns ``(bytes, input_bytes, capped, error)``.  ``bytes`` never exceeds
+    ``cap``; the stream is only fully measured when ``capped`` is false and
+    ``error`` is None.  Members are decoded by zlib directly, so a malformed
+    second-member header cannot block inside the standard library's gzip
+    reader without a deadline check.
+    """
+
+    total = 0
+    consumed = 0
+    capped = False
+    error: Optional[str] = None
+    current_eof = False
+    need_new_member = False
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    fp.seek(0)
+    while not capped:
+        deadline.check()
+        chunk = fp.read(64 * 1024)
+        if not chunk:
+            break
+        consumed += len(chunk)
+        if need_new_member:
+            chunk = chunk.lstrip(b"\x00")
+            if not chunk:
+                continue
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            need_new_member = False
+            current_eof = False
+        data = chunk
+        while data:
+            limit = min(PROBE_SLICE, cap - total + 1)
+            try:
+                produced = decompressor.decompress(data, limit)
+            except zlib.error as exc:
+                error = str(exc)
+                break
+            total += len(produced)
+            if total > cap:
+                total = cap
+                capped = True
+                break
+            if decompressor.eof:
+                current_eof = True
+                data = decompressor.unused_data.lstrip(b"\x00")
+                if not data:
+                    need_new_member = True
+                    break
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                current_eof = False
+                continue
+            tail = decompressor.unconsumed_tail
+            if tail:
+                data = tail
+                continue
+            data = b""
+        if error or capped:
+            break
+    if not capped and error is None and not current_eof:
+        error = "gzip stream ended before its trailer"
+    return total, consumed, capped, error
+
+
 def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
     deadline.check()
     flags, name, notes = _header(fp, size, limits)
@@ -68,45 +142,102 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
     if len(isize_raw) < 4:
         raise FormatError("gzip member has no trailer")
     isize = u32le(isize_raw)
-    declared = isize
+    declared: Optional[int] = isize
     measured = False
     probe_capped = False
     probe_input: Optional[int] = None
+    probe_output: Optional[int] = None
+    unknown = False
+    error: Optional[str] = None
 
-    if isize == 0 and size > 64 and limits.probe:
-        from .probe import bounded_probe
-
-        output, consumed, capped, _eof = bounded_probe(
-            fp,
-            0,
-            lambda: zlib.decompressobj(16 + zlib.MAX_WBITS),
-            limits.probe_limit,
-            deadline,
+    if limits.probe:
+        total, consumed, capped, error = _probe_total(
+            fp, limits.probe_limit, deadline
         )
-        declared = output
         measured = True
         probe_capped = capped
         probe_input = consumed
+        probe_output = total
+        if capped:
+            # The measured prefix is a hard lower bound.  A larger ISIZE is
+            # still untrusted metadata, but it is the same claim every other
+            # static rule acts on, so use it as the best available estimate.
+            declared = max(total, isize)
+            unknown = True
+            notes.append(
+                f"bounded multi-member probe stopped at {limits.probe_limit} "
+                "bytes of output; the real total is larger and cannot be "
+                "determined statically"
+            )
+            if isize > total:
+                notes.append(
+                    f"the final member's ISIZE claims {isize} bytes; if accurate, "
+                    "the real total is at least that, but it could not be measured"
+                )
+            elif isize < limits.probe_limit:
+                notes.append(
+                    f"ISIZE declares only {isize} bytes (the final member); the "
+                    "stream is already larger than that"
+                )
+        else:
+            declared = total if total else isize
+            if error:
+                unknown = True
+                notes.append(
+                    f"bounded multi-member probe could not finish: {error}"
+                )
+            else:
+                notes.append(
+                    f"bounded multi-member probe measured {total} bytes across all "
+                    "gzip members"
+                )
+    elif isize == 0:
+        unknown = True
         notes.append(
-            "ISIZE is zero (empty file or a multiple of 4 GiB); used a bounded "
-            "decompression probe"
+            "ISIZE is zero; the real size cannot be determined with probing disabled"
         )
 
     detail = "gzip"
     if name:
         detail += f", original name {name!r}"
-    notes.append("gzip ISIZE describes the final member and wraps at 4 GiB")
+    notes.append("gzip ISIZE describes only the final member and wraps at 4 GiB")
+
+    findings: List[Finding] = []
+    if (
+        measured
+        and not probe_capped
+        and error is None
+        and isize
+        and declared is not None
+        and declared > isize
+    ):
+        findings.append(
+            Finding(
+                code="ISIZE_UNDERSTATED",
+                severity=Severity.LOW,
+                title="gzip ISIZE does not cover the whole stream",
+                detail=(
+                    f"The final member's ISIZE trailer declares {isize} bytes, "
+                    f"but bounded decompression measured {declared} bytes across "
+                    "concatenated members. This is legal for multi-member gzip, "
+                    "but it also hides expansion from metadata-only scans."
+                ),
+                evidence={"isize": isize, "measured": declared},
+            )
+        )
 
     return Facts(
         format="gzip",
         detail=detail,
         declared_uncompressed=declared,
         declared_compressed=size,
+        findings=findings,
         measured=measured,
         probe_capped=probe_capped,
         probe_input=probe_input,
+        probe_output=probe_output,
         notes=notes,
-        unknown=probe_capped,
+        unknown=unknown,
     )
 
 

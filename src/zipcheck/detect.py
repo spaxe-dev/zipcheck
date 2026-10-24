@@ -82,10 +82,15 @@ def extension_suggests_archive(path: str) -> bool:
     return _extension(path) in ARCHIVE_EXTENSIONS
 
 
-def sniff(head: bytes, path: str = "") -> Tuple[Optional[str], str]:
+def sniff(
+    head: bytes, path: str = "", allow_extension: bool = True
+) -> Tuple[Optional[str], str]:
     """Return ``(format_key, why)`` or ``(None, "")``.
 
     ``head`` needs only the first ~512 bytes plus (for ZIP) the extension.
+    ``allow_extension=False`` is used for readable archive members: a member
+    named ``notes.zip`` that contains text is data, not a nested archive.  The
+    exception is tar and bare LZMA, whose magic is weak or optional.
     """
 
     ext = _extension(path)
@@ -109,30 +114,42 @@ def sniff(head: bytes, path: str = "") -> Tuple[Optional[str], str]:
     if len(head) >= 512 and head[257:262] == b"ustar":
         return "tar", "ustar header at offset 257"
 
-    # Fallbacks for weak/optional magic.
-    if ext in ZIP_EXTENSIONS:
-        return "zip", "ZIP extension"
-    if ext in TAR_EXTENSIONS:
-        return "tar", "tar extension"
-    if ext in SEVENZIP_EXTENSIONS:
-        return "7z", "7-Zip extension"
-    if ext in RAR_EXTENSIONS:
-        return "rar5" if head.startswith(RAR5_MAGIC) else "rar4", "RAR extension"
-    if ext in GZIP_EXTENSIONS:
-        return "gzip", "gzip extension"
-    if ext in BZIP2_EXTENSIONS:
-        return "bzip2", "bzip2 extension"
-    if ext in XZ_EXTENSIONS:
-        return "xz", "xz extension"
-    if ext in LZMA_EXTENSIONS:
-        return "lzma", "LZMA extension"
-    if ext in ZSTD_EXTENSIONS:
-        return "zstd", "Zstandard extension"
+    if allow_extension:
+        # Fallbacks for weak/optional magic.
+        if ext in ZIP_EXTENSIONS:
+            return "zip", "ZIP extension"
+        if ext in TAR_EXTENSIONS:
+            return "tar", "tar extension"
+        if ext in SEVENZIP_EXTENSIONS:
+            return "7z", "7-Zip extension"
+        if ext in RAR_EXTENSIONS:
+            return "rar5" if head.startswith(RAR5_MAGIC) else "rar4", "RAR extension"
+        if ext in GZIP_EXTENSIONS:
+            return "gzip", "gzip extension"
+        if ext in BZIP2_EXTENSIONS:
+            return "bzip2", "bzip2 extension"
+        if ext in XZ_EXTENSIONS:
+            return "xz", "xz extension"
+        if ext in LZMA_EXTENSIONS:
+            return "lzma", "LZMA extension"
+        if ext in ZSTD_EXTENSIONS:
+            return "zstd", "Zstandard extension"
+    else:
+        # Self-extracting ZIPs carry a stub before the signature.
+        if ext in ZIP_EXTENSIONS and any(sig in head for sig in ZIP_MAGICS):
+            return "zip", "ZIP signature inside member"
+        if ext in TAR_EXTENSIONS:
+            return "tar", "tar extension"
+        if ext in LZMA_EXTENSIONS:
+            return "lzma", "LZMA extension"
+
     if len(head) >= 3 and head.startswith(LZMA_MAGIC):
         return "lzma", "LZMA-alone magic"
     return None, ""
 
 
-def looks_like_archive(head: bytes, path: str = "") -> bool:
-    fmt, _ = sniff(head, path)
+def looks_like_archive(
+    head: bytes, path: str = "", allow_extension: bool = True
+) -> bool:
+    fmt, _ = sniff(head, path, allow_extension)
     return fmt is not None

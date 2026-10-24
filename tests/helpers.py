@@ -381,7 +381,7 @@ def seven_num(value):
     raise ValueError("too large")
 
 
-def build_7z_declared(path, folder_size=1 * 1024**4):
+def build_7z_declared(path, folder_size=1 * 1024**4, name="bomb.bin"):
     header = bytearray()
     header += b"\x01"  # kHeader
     header += b"\x04"  # kMainStreamsInfo
@@ -391,8 +391,8 @@ def build_7z_declared(path, folder_size=1 * 1024**4):
     header += b"\x0c" + seven_num(folder_size) + b"\x00"
     header += b"\x00"  # end StreamsInfo
     header += b"\x05" + seven_num(1)
-    name = "bomb.bin".encode("utf-16-le") + b"\x00\x00"
-    header += b"\x11" + seven_num(1 + len(name)) + b"\x00" + name
+    raw_name = name.encode("utf-16-le") + b"\x00\x00"
+    header += b"\x11" + seven_num(1 + len(raw_name)) + b"\x00" + raw_name
     header += b"\x00"  # end FilesInfo
     header += b"\x00"  # end Header
 
@@ -428,15 +428,15 @@ def rar5_block(block_type, flags, body=b"", extra=b"", data_size=0):
     return struct.pack("<I", crc) + rar5_vint(len(header)) + bytes(header)
 
 
-def build_rar5_declared(path, unp_size=1 * 1024**4):
+def build_rar5_declared(path, unp_size=1 * 1024**4, name="bomb.bin"):
     body = bytearray()
     body += rar5_vint(0)  # file flags: no time, no crc
     body += rar5_vint(unp_size)
     body += rar5_vint(0)  # attributes
     body += rar5_vint(0)  # compression info
     body += rar5_vint(0)  # host OS
-    name = b"bomb.bin"
-    body += rar5_vint(len(name)) + name
+    raw_name = name.encode()
+    body += rar5_vint(len(raw_name)) + raw_name
     main = rar5_block(1, 0, body=rar5_vint(0))
     file_block = rar5_block(2, 0, body=bytes(body))
     end = rar5_block(5, 0)
