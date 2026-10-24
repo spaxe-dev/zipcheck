@@ -13,6 +13,6 @@ pkgbase = zipcheck
 	makedepends = python-setuptools
 	makedepends = python-wheel
 	source = zipcheck-0.1.0.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = ac53a3a2864268e5007fa4127f9e06cf24209d6664b9907cfafa82fc2ed282cc
 
 pkgname = zipcheck

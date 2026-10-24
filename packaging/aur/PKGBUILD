@@ -10,7 +10,7 @@ depends=('python')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 checkdepends=('python-hypothesis' 'python-pytest')
 source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-$pkgver.tar.gz")
-sha256sums=('SKIP') # run updpkgsums after the PyPI release exists
+sha256sums=('ac53a3a2864268e5007fa4127f9e06cf24209d6664b9907cfafa82fc2ed282cc')
 
 build() {
   cd "$pkgname-$pkgver"
