@@ -1,6 +1,6 @@
 # Maintainer: Spaxe <182298766+spaxe-dev@users.noreply.github.com>
 pkgname=zipcheck
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Static archive-bomb scanner that never extracts anything"
 arch=('any')
@@ -10,7 +10,7 @@ depends=('python')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 checkdepends=('python-hypothesis' 'python-pytest')
 source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-$pkgver.tar.gz")
-sha256sums=('ac53a3a2864268e5007fa4127f9e06cf24209d6664b9907cfafa82fc2ed282cc')
+sha256sums=('7aa5e0a41c046d0a6ab259e53f5fc2f0b7b8afb0b710ecc8bc5ffd2db7b84e89')
 
 build() {
   cd "$pkgname-$pkgver"
