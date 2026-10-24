@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .detect import extension_suggests_archive
@@ -131,6 +132,25 @@ def build_parser() -> argparse.ArgumentParser:
             "--require-verified)"
         ),
     )
+    password_group = parser.add_mutually_exclusive_group()
+    password_group.add_argument(
+        "--password",
+        metavar="TEXT",
+        help=(
+            "password for encrypted ZIP members (visible in shell history and "
+            "the process list; prefer --ask-password or --password-file)"
+        ),
+    )
+    password_group.add_argument(
+        "--password-file",
+        metavar="PATH",
+        help="read the ZIP password from the first line of a file",
+    )
+    password_group.add_argument(
+        "--ask-password",
+        action="store_true",
+        help="prompt for the ZIP password on the terminal",
+    )
     parser.add_argument(
         "--ratio",
         type=float,
@@ -162,6 +182,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"zipcheck {__version__}")
     return parser
+
+
+def _resolve_password(args: argparse.Namespace) -> Tuple[Optional[bytes], Optional[int]]:
+    """Return ``(password, exit_code)``; one of them is always None."""
+
+    if args.password is not None:
+        value = args.password.encode("utf-8")
+        if not value:
+            print("zipcheck: --password must not be empty", file=sys.stderr)
+            return None, 4
+        return value, None
+    if args.password_file is not None:
+        try:
+            with open(args.password_file, "rb") as handle:
+                value = handle.readline().rstrip(b"\r\n")
+        except OSError as exc:
+            print(f"zipcheck: cannot read password file: {exc}", file=sys.stderr)
+            return None, 4
+        if not value:
+            print("zipcheck: password file is empty", file=sys.stderr)
+            return None, 4
+        return value, None
+    if args.ask_password:
+        try:
+            value = getpass.getpass("Archive password: ").encode("utf-8")
+        except (EOFError, KeyboardInterrupt):
+            print("zipcheck: no password entered", file=sys.stderr)
+            return None, 4
+        return (value or None), None
+    return None, None
 
 
 def _collect_paths(paths: Sequence[str], recursive: bool) -> List[str]:
@@ -278,7 +328,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("zipcheck: no archive files found", file=sys.stderr)
         return 4
 
+    password, password_error = _resolve_password(args)
+    if password_error is not None:
+        return password_error
+
     limits = Limits(
+        password=password,
         max_depth=max(0, args.depth),
         timeout=max(0.0, args.timeout),
         probe=args.probe,

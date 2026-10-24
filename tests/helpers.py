@@ -16,6 +16,11 @@ import tarfile
 import zipfile
 import zlib
 
+try:
+    import pyzipper
+except ImportError:  # optional extra; only encrypted fixtures need it
+    pyzipper = None
+
 # ---------------------------------------------------------------------------
 # ZIP
 # ---------------------------------------------------------------------------
@@ -23,6 +28,19 @@ import zlib
 
 def make_zip(path, members, method=zipfile.ZIP_DEFLATED):
     with zipfile.ZipFile(path, "w", method) as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return path
+
+
+def make_encrypted_zip(path, members, password, method=zipfile.ZIP_DEFLATED):
+    """Create a WinZip AES-256 archive; requires the optional pyzipper."""
+    if pyzipper is None:
+        raise RuntimeError("pyzipper is required to build encrypted fixtures")
+    with pyzipper.AESZipFile(
+        path, "w", compression=method, encryption=pyzipper.WZ_AES
+    ) as zf:
+        zf.setpassword(password)
         for name, data in members.items():
             zf.writestr(name, data)
     return path

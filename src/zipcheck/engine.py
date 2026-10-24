@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from typing import BinaryIO, List, Optional
 
 from . import detect
+from .decrypt import (
+    DECRYPTABLE_METHODS,
+    DecryptionError,
+    ZipDecryptor,
+    open_zip_decryptor,
+)
 from .formats import (
     bzip2fmt,
     gzipfmt,
@@ -189,6 +195,12 @@ def _scan_stream(
             error="nested inspection budget exhausted",
             unknown=True,
             depth=depth,
+        )
+
+    if limits.password is not None and fmt != "zip" and facts.encrypted:
+        facts.notes.append(
+            f"a password was supplied, but {fmt} decryption is not supported; "
+            "encrypted members remain opaque"
         )
 
     result = result_from_facts(path, size, facts, depth)
@@ -677,9 +689,15 @@ def _nested_name(parent: ScanResult, member: str) -> str:
     return f"{parent.path}!{member}"
 
 
-def _remaining_archive_hint(entries: List[EntryInfo], start: int) -> bool:
+def _remaining_archive_hint(
+    entries: List[EntryInfo], start: int, password_supplied: bool = False
+) -> bool:
     return any(
-        not entry.is_dir and detect.extension_suggests_archive(entry.name)
+        not entry.is_dir
+        and (
+            detect.extension_suggests_archive(entry.name)
+            or (password_supplied and entry.encrypted)
+        )
         for entry in entries[start:]
     )
 
@@ -702,6 +720,29 @@ def _inspect_zip(
         else limits.nested_prefix_bytes
     )
 
+    decryptor: Optional[ZipDecryptor] = None
+    decrypt_error: Optional[str] = None
+    if limits.password is not None and any(entry.encrypted for entry in facts.entries):
+        if facts.complete:
+            try:
+                decryptor = open_zip_decryptor(fp, facts.entries, limits.password)
+            except DecryptionError as exc:
+                decrypt_error = str(exc)
+        else:
+            decrypt_error = (
+                "encrypted members were not decrypted because the ZIP metadata "
+                "was only partially parsed"
+            )
+        # A supplied password signals that encrypted content matters.  If the
+        # decryptor could not be opened, fail closed once for the whole
+        # archive instead of trusting names that do not look like archives.
+        if decrypt_error is not None:
+            _mark_incomplete(
+                parent,
+                limits,
+                f"encrypted members were not decrypted: {decrypt_error}",
+            )
+
     def mark_unverified(entry: object, why: str) -> None:
         _mark_incomplete(
             parent,
@@ -709,161 +750,227 @@ def _inspect_zip(
             f"nested archive {getattr(entry, 'name', '?')!r} not inspected: {why}",
         )
 
-    for index, entry in enumerate(facts.entries):
-        if inspected >= limits.max_nested_candidates:
-            if limits.verify or _remaining_archive_hint(facts.entries, index):
-                _mark_incomplete(
-                    parent,
-                    limits,
-                    "nested candidate limit reached; not every member was inspected",
-                )
-            else:
-                parent.notes.append(
-                    "nested candidate limit reached; remaining members do not "
-                    "look like archives"
-                )
-            break
-        if examined >= limits.max_nested_examined:
-            if limits.verify or _remaining_archive_hint(facts.entries, index):
-                _mark_incomplete(
-                    parent,
-                    limits,
-                    "nested candidate scan limit reached; not every member was "
-                    "inspected",
-                )
-            else:
-                parent.notes.append(
-                    "nested candidate scan limit reached; remaining members do "
-                    "not look like archives"
-                )
-            break
-        if entry.is_dir:
-            continue
-        archive_hint = detect.extension_suggests_archive(entry.name)
-        if (
-            entry.encrypted
-            or not entry.csize
-            or entry.data_offset is None
-            or entry.method not in ("stored", "deflate", "bzip2", "lzma")
-        ):
-            if archive_hint:
-                mark_unverified(entry, "encrypted or unsupported compression method")
-            continue
-        if entry.csize > limits.max_nested_compressed:
-            if archive_hint:
-                mark_unverified(entry, "compressed member exceeds the nested scan cap")
-            elif limits.verify:
-                probe = member_probe(
-                    fp,
-                    entry,
-                    1024,
-                    limits.nested_prefix_bytes,
-                    limits.max_decoder_memory,
-                    context.deadline,
-                )
-                if detect.looks_like_archive(probe, ""):
+    try:
+        for index, entry in enumerate(facts.entries):
+            if inspected >= limits.max_nested_candidates:
+                if limits.verify or _remaining_archive_hint(
+                    facts.entries, index, limits.password is not None
+                ):
+                    _mark_incomplete(
+                        parent,
+                        limits,
+                        "nested candidate limit reached; not every member was inspected",
+                    )
+                else:
+                    parent.notes.append(
+                        "nested candidate limit reached; remaining members do not "
+                        "look like archives"
+                    )
+                break
+            if examined >= limits.max_nested_examined:
+                if limits.verify or _remaining_archive_hint(
+                    facts.entries, index, limits.password is not None
+                ):
+                    _mark_incomplete(
+                        parent,
+                        limits,
+                        "nested candidate scan limit reached; not every member was "
+                        "inspected",
+                    )
+                else:
+                    parent.notes.append(
+                        "nested candidate scan limit reached; remaining members do "
+                        "not look like archives"
+                    )
+                break
+            if entry.is_dir:
+                continue
+            archive_hint = detect.extension_suggests_archive(entry.name)
+            if entry.encrypted:
+                if decryptor is None:
+                    if decrypt_error is None and archive_hint:
+                        mark_unverified(
+                            entry,
+                            "encrypted member was not inspected; supply a "
+                            "password to decrypt it",
+                        )
+                    continue
+                if entry.method not in DECRYPTABLE_METHODS:
                     mark_unverified(
                         entry,
-                        "archive is too large to capture for deep verification",
+                        f"encrypted member uses unsupported method {entry.method}",
                     )
-            continue
-        if entry.data_offset + entry.csize > size:
-            if archive_hint:
-                mark_unverified(entry, "member data extends past the end of the file")
-            continue
-        examined += 1
-        context.deadline.check()
-        try:
-            head = member_prefix(
-                fp,
-                entry,
-                1024 if limits.verify else 64,
-                limits.max_nested_compressed,
-                limits.max_decoder_memory,
-                context.deadline,
-            )
-        except (OSError, ValueError):
-            continue
-        if not detect.looks_like_archive(
-            head, entry.name, allow_extension=False
-        ):
-            continue
-        if context.nested_archives >= limits.max_nested_archives:
-            _mark_incomplete(
-                parent,
-                limits,
-                "nested archive limit reached; stopping inspection",
-            )
-            break
-        if context.nested_used >= limits.nested_budget_bytes:
-            _mark_incomplete(
-                parent,
-                limits,
-                "nested inspection budget reached; stopping inspection",
-            )
-            break
-
-        if limits.verify:
-            data, complete = member_image(
-                fp,
-                size,
-                entry,
-                capture_cap,
-                limits.max_nested_compressed,
-                limits.max_decoder_memory,
-                context.deadline,
-            )
-            truncated = not complete
-            if not complete:
-                mark_unverified(
-                    entry, "member exceeds the nested verification capture cap"
-                )
-        else:
-            cap = min(
-                entry.usize
-                if entry.usize is not None
-                else limits.nested_prefix_bytes,
-                limits.nested_prefix_bytes,
-            )
-            if cap <= 0:
+                    continue
+            elif (
+                not entry.csize
+                or entry.data_offset is None
+                or entry.method not in ("stored", "deflate", "bzip2", "lzma")
+            ):
+                if archive_hint:
+                    mark_unverified(
+                        entry, "unsupported compression method or missing data"
+                    )
                 continue
-            if context.nested_used + cap > limits.nested_budget_bytes:
+            if not entry.csize or entry.data_offset is None:
+                if archive_hint:
+                    mark_unverified(entry, "member has no readable data range")
+                continue
+            if entry.csize > limits.max_nested_compressed:
+                if archive_hint:
+                    mark_unverified(
+                        entry, "compressed member exceeds the nested scan cap"
+                    )
+                elif limits.verify and not entry.encrypted:
+                    probe = member_probe(
+                        fp,
+                        entry,
+                        1024,
+                        limits.nested_prefix_bytes,
+                        limits.max_decoder_memory,
+                        context.deadline,
+                    )
+                    if detect.looks_like_archive(probe, ""):
+                        mark_unverified(
+                            entry,
+                            "archive is too large to capture for deep verification",
+                        )
+                continue
+            if entry.data_offset + entry.csize > size:
+                if archive_hint:
+                    mark_unverified(
+                        entry, "member data extends past the end of the file"
+                    )
+                continue
+            examined += 1
+            context.deadline.check()
+            try:
+                if entry.encrypted:
+                    assert decryptor is not None
+                    head, _ = decryptor.read_image(
+                        index,
+                        entry,
+                        1024 if limits.verify else 64,
+                        context.deadline,
+                    )
+                else:
+                    head = member_prefix(
+                        fp,
+                        entry,
+                        1024 if limits.verify else 64,
+                        limits.max_nested_compressed,
+                        limits.max_decoder_memory,
+                        context.deadline,
+                    )
+            except DecryptionError as exc:
+                mark_unverified(entry, f"decryption failed: {exc}")
+                continue
+            except (OSError, ValueError):
+                continue
+            if not detect.looks_like_archive(
+                head, entry.name, allow_extension=False
+            ):
+                continue
+            if context.nested_archives >= limits.max_nested_archives:
+                _mark_incomplete(
+                    parent,
+                    limits,
+                    "nested archive limit reached; stopping inspection",
+                )
+                break
+            if context.nested_used >= limits.nested_budget_bytes:
                 _mark_incomplete(
                     parent,
                     limits,
                     "nested inspection budget reached; stopping inspection",
                 )
                 break
-            try:
-                data = member_prefix(
-                    fp,
-                    entry,
-                    cap,
-                    limits.max_nested_compressed,
-                    limits.max_decoder_memory,
-                    context.deadline,
+
+            if limits.verify:
+                try:
+                    if entry.encrypted:
+                        assert decryptor is not None
+                        data, complete = decryptor.read_image(
+                            index, entry, capture_cap, context.deadline
+                        )
+                    else:
+                        data, complete = member_image(
+                            fp,
+                            size,
+                            entry,
+                            capture_cap,
+                            limits.max_nested_compressed,
+                            limits.max_decoder_memory,
+                            context.deadline,
+                        )
+                except DecryptionError as exc:
+                    mark_unverified(entry, f"decryption failed: {exc}")
+                    continue
+                truncated = not complete
+                if not complete:
+                    mark_unverified(
+                        entry, "member exceeds the nested verification capture cap"
+                    )
+            else:
+                cap = min(
+                    entry.usize
+                    if entry.usize is not None
+                    else limits.nested_prefix_bytes,
+                    limits.nested_prefix_bytes,
                 )
-            except (OSError, ValueError):
+                if cap <= 0:
+                    continue
+                if context.nested_used + cap > limits.nested_budget_bytes:
+                    _mark_incomplete(
+                        parent,
+                        limits,
+                        "nested inspection budget reached; stopping inspection",
+                    )
+                    break
+                try:
+                    if entry.encrypted:
+                        assert decryptor is not None
+                        data, complete = decryptor.read_image(
+                            index, entry, cap, context.deadline
+                        )
+                        truncated = not complete
+                    else:
+                        data = member_prefix(
+                            fp,
+                            entry,
+                            cap,
+                            limits.max_nested_compressed,
+                            limits.max_decoder_memory,
+                            context.deadline,
+                        )
+                        truncated = (
+                            entry.usize is not None and len(data) < entry.usize
+                        )
+                except DecryptionError as exc:
+                    mark_unverified(entry, f"decryption failed: {exc}")
+                    continue
+                except (OSError, ValueError):
+                    continue
+                if truncated:
+                    mark_unverified(
+                        entry, "member exceeds the static nested prefix cap"
+                    )
+            if not data:
                 continue
-            truncated = entry.usize is not None and len(data) < entry.usize
-            if truncated:
-                mark_unverified(
-                    entry, "member exceeds the static nested prefix cap"
-                )
-        if not data:
-            continue
-        context.spend(len(data))
-        child = _scan_bytes_nested(
-            data,
-            _nested_name(parent, entry.name),
-            context,
-            depth + 1,
-            truncated,
-        )
-        children.append(child)
-        inspected += 1
-        if child.verdict == "dangerous":
-            break
+            context.spend(len(data))
+            child = _scan_bytes_nested(
+                data,
+                _nested_name(parent, entry.name),
+                context,
+                depth + 1,
+                truncated,
+            )
+            children.append(child)
+            inspected += 1
+            if child.verdict == "dangerous":
+                break
+    finally:
+        if decryptor is not None:
+            decryptor.close()
     return children
 
 

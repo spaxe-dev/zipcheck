@@ -43,6 +43,7 @@ $ zipcheck suspicious.zip
 - [Usage](#usage)
 - [Detection rules](#detection-rules)
 - [Content verification](#content-verification)
+- [Encrypted ZIPs](#encrypted-zips)
 - [How each format is measured](#how-each-format-is-measured)
 - [Nested archives and deep bombs](#nested-archives-and-deep-bombs)
 - [Safety model](#safety-model)
@@ -99,10 +100,11 @@ examples.
 ## What it detects
 
 - **ZIP / ZIP64** — declared expansion, per-entry impossible ratios, overlapping
-  or shared entries, encrypted archive members, member count, contradictory
-  local/central headers, entries hidden from the EOCD count, and a bounded
-  stream-tail probe that catches a compressed stream extending past a forged
-  compressed size when it leaves an unexplained gap.
+  or shared entries, encrypted archive members (decrypted and followed when a
+  password is supplied), member count, contradictory local/central headers,
+  entries hidden from the EOCD count, and a bounded stream-tail probe that
+  catches a compressed stream extending past a forged compressed size when it
+  leaves an unexplained gap.
 - **TAR** — huge declared members, sparse members, truncated archives, PAX and
   GNU long names, nested archives.
 - **gzip** — every stream is measured with a bounded multi-member probe, so
@@ -118,11 +120,12 @@ examples.
   unknown.
 - **Nested archives** — ZIP, TAR, gzip, bzip2 and xz are followed up to a
   configurable depth. Archive-like members inside 7z/RAR, encrypted archive-like
-  members, and chains stopped by a cap are reported `unknown` instead of being
-  silently skipped.
+  members without a password, and chains stopped by a cap are reported `unknown`
+  instead of being silently skipped.
 - **Content verification** — optional bounded decompression to a counting sink
   catches headers that understate the real size (ZIP stored/deflate/bzip2/LZMA,
-  gzip, bzip2, xz/LZMA; TAR plan validation).
+  gzip, bzip2, xz/LZMA; TAR plan validation), including encrypted ZIP members
+  when a password is provided.
 
 Every result is one of: `clean`, `suspicious`, `dangerous`, `unknown`.
 **`unknown` is not a safe verdict** — it means the scanner could not prove
@@ -138,17 +141,23 @@ anything either way.
 
 ## Install
 
-Requires Python 3.10+. No runtime dependencies.
+Requires Python 3.10+. There are no required runtime dependencies.
+
+WinZip AES-encrypted ZIPs need the optional `aes` extra, which installs
+[`pyzipper`](https://pypi.org/project/pyzipper/). Legacy ZipCrypto archives work
+without it.
 
 ```bash
 pip install zipcheck
+pip install 'zipcheck[aes]'       # + AES-encrypted ZIP support
 
 # isolated CLI install (recommended for command-line use)
 pipx install zipcheck
+pipx install 'zipcheck[aes]'
 # or
-uv tool install zipcheck
+uv tool install 'zipcheck[aes]'
 
-# Arch Linux
+# Arch Linux (python-pyzipper is an optional dependency for AES)
 yay -S zipcheck
 ```
 
@@ -157,11 +166,11 @@ From a checkout:
 ```bash
 git clone https://github.com/spaxe-dev/zipcheck
 cd zipcheck
-python -m pip install .
+python -m pip install '.[aes]'
 PYTHONPATH=src python -m zipcheck file.rar   # run without installing
 ```
 
-Container:
+Container (the bundled image includes the AES extra):
 
 ```bash
 docker build -t zipcheck .
@@ -199,6 +208,12 @@ zipcheck -v archive.7z
 
 # production pre-flight: measure real output and fail closed
 zipcheck --production --verify-limit 256MiB --timeout 30 --json upload.zip
+
+# encrypted ZIP: prompt for the password (not visible in shell history)
+zipcheck --ask-password --production secret.zip
+
+# encrypted ZIP in a script: read the password from a file
+zipcheck --password-file /run/secrets/zip-password --json secret.zip
 ```
 
 Options:
@@ -216,6 +231,9 @@ Options:
 | `--verify-limit SIZE` | `512MiB` | Maximum output produced by verification |
 | `--require-verified` | off | Make unverifiable files `unknown` (implies `--verify`) |
 | `--production` | off | Fail-closed preset: implies `--verify --require-verified` |
+| `--password TEXT` | none | Password for encrypted ZIP members (visible in shell history/process list) |
+| `--password-file PATH` | none | Read the ZIP password from the first line of a file |
+| `--ask-password` | off | Prompt for the ZIP password on the terminal |
 | `--ratio FLOAT` | `100` | Expansion ratio considered suspicious |
 | `--dangerous-ratio FLOAT` | `1000` | Expansion ratio considered dangerous |
 | `--min-size SIZE` | `16MiB` | Ignore ratios below this declared output |
@@ -260,7 +278,7 @@ verdict; `HIGH`/`CRITICAL` → *dangerous*, `MEDIUM` → *suspicious*.
 | `ENTRY_COUNT_MISMATCH` | HIGH / MEDIUM | The central directory contains more (HIGH) or fewer (MEDIUM) entries than the EOCD counts |
 | `NESTED_BOMB` / `NESTED_SUSPICIOUS` | HIGH / MEDIUM | A nested archive has that verdict |
 | `INSPECTION_INCOMPLETE` | MEDIUM | Nested inspection was incomplete (caps, truncation, opaque or unknown nested members); static verdict is `unknown` |
-| `ENCRYPTED_NESTED_ARCHIVE` | MEDIUM | Encrypted members look like archives and cannot be recursed into |
+| `ENCRYPTED_NESTED_ARCHIVE` | MEDIUM | Encrypted members look like archives and no password was supplied |
 | `ISIZE_UNDERSTATED` | LOW | The measured gzip output exceeds the final member's `ISIZE` trailer |
 | `METADATA_UNDERSTATED` | HIGH (ZIP) / MEDIUM (streams) | Real decompressed output exceeds the declared size |
 | `METADATA_OVERSTATED` | MEDIUM | Declared size exceeds the real output |
@@ -306,10 +324,50 @@ When verification was requested but did not cover the whole file, an `UNVERIFIED
 - `--production` → shorthand for `--verify --require-verified`.
 
 This measures content; it is **not** a sandbox. The capped decompression still
-runs inside your process and consumes CPU and memory. Encrypted members, 7z/RAR
-member data, and methods without a stdlib decoder remain unverifiable and fail
-closed. The enforceable production boundary is still isolated extraction with
-OS quotas — see [docs/production.md](docs/production.md).
+runs inside your process and consumes CPU and memory. Encrypted members without
+a password, 7z/RAR member data, and methods without a stdlib decoder remain
+unverifiable and fail closed. The enforceable production boundary is still
+isolated extraction with OS quotas — see [docs/production.md](docs/production.md).
+
+---
+
+## Encrypted ZIPs
+
+ZIP encryption hides member **content**, not the central directory: names,
+sizes, compression methods and the encryption flag stay readable. That is why a
+password-protected bomb still shows up as a ZIP and can be measured statically;
+what it hides is the *real* expansion and any nested archives inside each
+encrypted member.
+
+Pass one of the three password options to let zipcheck decrypt members while it
+scans:
+
+```bash
+zipcheck --ask-password bomb.zip
+zipcheck --password-file /run/secrets/pw bomb.zip
+zipcheck --password '42' bomb.zip      # convenient, but leaks via argv/history
+```
+
+- Both **WinZip AES** (AE-1/AE-2) and legacy **ZipCrypto** are supported.
+  AES needs the optional `aes` extra (`pip install 'zipcheck[aes]'`); ZipCrypto
+  is handled by the standard library.
+- Decryption is bounded exactly like ordinary scanning: 64 KiB read chunks, the
+  per-file timeout, the nested capture limits, and `--verify-limit`. Decrypted
+  bytes are counted or held in a bounded in-memory image; nothing is written to
+  disk.
+- Zipcheck does not brute-force or guess passwords. A wrong password, a missing
+  AES backend, or an unsupported encryption method makes the affected members
+  uninspectable, so static mode reports `unknown` and `--production` rejects the
+  file. It never falls back to `clean`.
+- Passwords are never logged, never included in JSON/notes, and never stored in
+  `Limits` representations. Prefer `--ask-password` or `--password-file`; using
+  `--password` exposes the value to shell history and the process list.
+- Only ZIP encryption is handled. Encrypted 7z/RAR data and encrypted RAR
+  headers remain opaque and fail closed.
+
+With a password, the real-world AES-encrypted `42.zip` is followed through its
+nested layers and reported `dangerous`. Without one it stays `unknown`, which is
+the honest answer.
 
 ---
 
@@ -421,8 +479,9 @@ verification as a top-level file, recursively.
 Inspection **fails closed**. If a depth, candidate, archive-count or byte
 budget stops the scan while archive-like members remain unexamined, if a
 candidate can only be read as a truncated prefix, if a child scan is itself
-unknown, or if a 7z/RAR/encrypted member looks like an archive and cannot be
-decoded, static mode reports the file `unknown` with `INSPECTION_INCOMPLETE`.
+unknown, or if a 7z/RAR member or an encrypted member without a password looks
+like an archive and cannot be decoded, static mode reports the file `unknown`
+with `INSPECTION_INCOMPLETE`.
 It is never reported `clean` just because the scanner gave up. Verified mode
 keeps its own contract: `suspicious`, or `unknown` under `--require-verified`.
 
@@ -433,8 +492,10 @@ When a nested bomb is found, scanning stops early and the parent is marked
 download.zip!lib0.zip!lib1.zip!...!payload.bin
 ```
 
-This is enough to catch 42.zip-style chains that are not encrypted. Encrypted
-bombs remain opaque; see below.
+This is enough to catch 42.zip-style chains that are not encrypted. If the
+outer layers are encrypted, supply a ZIP password (see
+[Encrypted ZIPs](#encrypted-zips)) and the same recursion runs on the decrypted
+members; without a password those members remain opaque and fail closed.
 
 ---
 
@@ -458,6 +519,9 @@ allocate an attacker-controlled amount of memory.
 - **LZMA decoder caps.** The xz path sets a 128 MiB decoder memory limit, so a
   malicious dictionary size cannot force a huge allocation.
 - **Wall-clock limit.** 60 seconds per file by default (`--timeout`).
+- **Passwords stay out of results.** A password is read from the terminal or a
+  file, used only for member decryption, and excluded from `Limits` repr/equality
+  and every finding, note and JSON field. It is never written anywhere.
 - **No recursion into data formats.** 7z and RAR member data is never decoded,
   so a solid archive cannot be used to burn CPU during a scan.
 - **No stat-then-open race.** The path is opened and `fstat`ed on the same file
@@ -499,7 +563,7 @@ used):
 | gzip-compressed sparse TAR | 142 B | 1.00 TiB (inner TAR) | dangerous |
 | non-recursive overlap ZIP | 4.2 KiB | 8 KiB | dangerous |
 | RAR 5, 256 MiB of zeros | 11 KiB | 256 MiB | suspicious |
-| real `42.zip` (AES-encrypted) | 41.8 KiB | opaque | unknown |
+| real `42.zip` (AES-encrypted, password `42`) | 41.8 KiB | 4 GiB at depth 6 | dangerous (exit 2); `unknown` without the password |
 | 7-Zip encoded header, 50 files | 729 B | 790 B | clean (correct) |
 | real RAR 4 archive | 336 B | 48 B | clean (correct) |
 
@@ -531,21 +595,31 @@ gzip-compressed sparse TAR, and the real 42.zip — scanned in ~0.19 seconds wit
 ~146 MiB peak RSS (the xz decoder's 64 MiB dictionary dominates). Reproduce
 with `tools/generate_samples.py` and `tools/benchmark.py` inside a VM/container.
 
+With the real `42.zip` password (`42`) supplied via `--password-file`, the same
+file is reported `dangerous` (exit `2`) in ~6 milliseconds: the outer AES layer
+is decrypted in memory and the nested chain is followed far enough to find a
+layer declaring 4 GiB. `--production` also returns `dangerous`; the deeper
+layers are not fully verifiable within the capture caps, but positive evidence
+outranks incompleteness. Without the password the file remains `unknown`
+(exit `3`).
+
 ---
 
 ## Limitations and honest caveats
 
-- **Encrypted archives are opaque.** zipcheck cannot decrypt AES or password-
-  protected members. Encrypted members named like archives make the file
-  `unknown` (via `INSPECTION_INCOMPLETE`), because a nested bomb cannot be ruled
-  out. The real 42.zip is exactly this case.
+- **Encrypted ZIPs need a password.** AES (WinZip) requires the `aes` extra;
+  ZipCrypto works in the base install. Without `--password`,
+  `--password-file` or `--ask-password`, encrypted members remain opaque and
+  archive-like ones make the file `unknown`. A wrong password, a missing AES
+  backend, or an unsupported method also fails closed — zipcheck does not
+  brute-force passwords.
 - **Headers can lie.** zipcheck flags entries hidden from the EOCD count,
   conflicting local/central headers, forged sizes that leave the real stream in
   an unexplained gap, and measured output larger than the declared size when
   the tail probe runs. A forgery arranged to look contiguous, or one outside
   the probe caps, cannot be proven from metadata; `--verify` measures it.
-  Formats the verifier cannot decode (7z, RAR, encrypted members) remain opaque
-  and fail closed.
+  Formats the verifier cannot decode (7z, RAR, encrypted members without a
+  password) remain opaque and fail closed.
 - **Static is not verification.** The ZIP tail probe only examines members
   whose declared data ends before the next structure, and is capped at 256
   members, 64 KiB compressed each and 4 MiB of total output. Its absence is
@@ -589,7 +663,7 @@ sample or a hex description — see [SECURITY.md](SECURITY.md).
 ```json
 {
   "tool": "zipcheck",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "elapsed_ms": 3.1,
   "summary": {"clean": 0, "suspicious": 0, "dangerous": 1, "unknown": 0},
   "results": [
@@ -649,6 +723,7 @@ Layout:
 src/zipcheck/
   engine.py           # orchestration, policy, nested inspection
   verify.py           # bounded content verification (counting sink)
+  decrypt.py          # bounded ZIP member decryption (AES/ZipCrypto)
   model.py            # facts/findings/results
   limits.py           # caps and thresholds
   detect.py           # magic/extension routing

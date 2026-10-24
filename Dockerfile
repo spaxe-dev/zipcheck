@@ -18,7 +18,7 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[aes]"
 
 RUN useradd --create-home --shell /usr/sbin/nologin scanner
 USER scanner

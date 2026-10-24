@@ -7,7 +7,8 @@ size.  The thresholds only affect the verdict, not memory safety.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,10 @@ class Limits:
     stream_probe_max_compressed: int = 64 * 1024
     stream_probe_max_output: int = 1024 * 1024
     stream_probe_total_output: int = 4 * 1024 * 1024
+
+    # --- password-based ZIP inspection ---
+    # Kept out of repr/equality so a Limits object can be logged safely.
+    password: Optional[bytes] = field(default=None, repr=False, compare=False)
 
     # --- content verification: actually decompress into a counting sink ---
     verify: bool = False

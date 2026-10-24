@@ -558,7 +558,10 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
         for entry in entries
         if entry.encrypted and entry.name.lower().endswith(archive_names)
     ]
-    if encrypted_archives:
+    # With a password the engine decrypts these members and records any
+    # per-member failure itself.  Emitting this generic finding as well would
+    # wrongly claim they were never inspected.
+    if encrypted_archives and limits.password is None:
         findings.append(
             Finding(
                 code="ENCRYPTED_NESTED_ARCHIVE",

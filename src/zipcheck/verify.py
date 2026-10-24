@@ -17,6 +17,12 @@ import zlib
 from dataclasses import dataclass, field
 from typing import BinaryIO, List, Optional, Tuple
 
+from .decrypt import (
+    DECRYPTABLE_METHODS,
+    DecryptionError,
+    ZipDecryptor,
+    open_zip_decryptor,
+)
 from .limits import Limits
 from .model import Finding, ScanResult, Severity
 from .reader import Deadline, u16le
@@ -92,6 +98,7 @@ def _verify_zip(
     findings: List[Finding] = []
     total = 0
     unsupported = 0
+    encrypted_skipped = 0
     errors: List[str] = []
     understated: List[Tuple[str, int, int]] = []
     overstated: List[Tuple[str, int, int]] = []
@@ -102,58 +109,109 @@ def _verify_zip(
         result.entry_count is None or len(result.entries) >= result.entry_count
     )
 
-    for entry in result.entries:
-        deadline.check()
-        if entry.is_dir:
-            continue
-        if entry.encrypted:
-            unsupported += 1
-            continue
-        if entry.method not in SUPPORTED_ZIP_METHODS:
-            unsupported += 1
-            continue
-        if entry.csize is None or entry.data_offset is None:
-            unsupported += 1
-            continue
-        remaining = budget - total
-        if remaining <= 0:
-            capped = True
-            break
-        counted = count_zip_entry(
-            fp, size, entry, remaining, limits, deadline
-        )
-        total += counted.total
-        declared_csize = entry.csize or 0
-        data_start = entry.data_offset or 0
-        available = min(declared_csize, max(0, size - data_start))
+    has_encrypted = any(entry.encrypted for entry in result.entries)
+    decryptor: Optional[ZipDecryptor] = None
+    decrypt_error: Optional[str] = None
+    if limits.password is not None and has_encrypted:
+        if complete:
+            try:
+                decryptor = open_zip_decryptor(
+                    fp, result.entries, limits.password
+                )
+            except DecryptionError as exc:
+                decrypt_error = str(exc)
+        else:
+            decrypt_error = (
+                "encrypted members were not decrypted because the ZIP metadata "
+                "was only partially parsed"
+            )
 
-        if counted.error:
-            errors.append(f"{entry.name}: {counted.error}")
-        elif not counted.capped:
-            if available < declared_csize:
-                errors.append(f"{entry.name}: member data is truncated")
-            elif not counted.eof:
-                if counted.fed == available:
-                    # We fed the directory-declared number of compressed
-                    # bytes and the stream still had not terminated.  A
-                    # stream-consuming extractor will read further bytes than
-                    # the metadata admits.
-                    short_streams.append(entry.name)
-                else:
-                    errors.append(
-                        f"{entry.name}: compressed stream did not terminate"
-                    )
-            elif counted.unused_compressed:
-                padded_streams.append(entry.name)
+    try:
+        for index, entry in enumerate(result.entries):
+            deadline.check()
+            if entry.is_dir:
+                continue
+            if entry.encrypted:
+                if (
+                    decryptor is None
+                    or entry.method not in DECRYPTABLE_METHODS
+                    or entry.csize is None
+                    or entry.data_offset is None
+                ):
+                    unsupported += 1
+                    encrypted_skipped += 1
+                    continue
+                remaining = budget - total
+                if remaining <= 0:
+                    capped = True
+                    break
+                decrypted = decryptor.count_member(
+                    index, entry, remaining, deadline
+                )
+                total += decrypted.total
+                if decrypted.error:
+                    errors.append(f"{entry.name}: {decrypted.error}")
+                if entry.usize is not None:
+                    if decrypted.total > entry.usize:
+                        understated.append(
+                            (entry.name, entry.usize, decrypted.total)
+                        )
+                    elif decrypted.total < entry.usize and decrypted.eof:
+                        overstated.append(
+                            (entry.name, entry.usize, decrypted.total)
+                        )
+                if decrypted.capped or total >= budget:
+                    capped = True
+                    break
+                continue
+            if entry.method not in SUPPORTED_ZIP_METHODS:
+                unsupported += 1
+                continue
+            if entry.csize is None or entry.data_offset is None:
+                unsupported += 1
+                continue
+            remaining = budget - total
+            if remaining <= 0:
+                capped = True
+                break
+            counted = count_zip_entry(
+                fp, size, entry, remaining, limits, deadline
+            )
+            total += counted.total
+            declared_csize = entry.csize or 0
+            data_start = entry.data_offset or 0
+            available = min(declared_csize, max(0, size - data_start))
 
-        if entry.usize is not None:
-            if counted.total > entry.usize:
-                understated.append((entry.name, entry.usize, counted.total))
-            elif counted.total < entry.usize and counted.eof:
-                overstated.append((entry.name, entry.usize, counted.total))
-        if counted.capped or total >= budget:
-            capped = True
-            break
+            if counted.error:
+                errors.append(f"{entry.name}: {counted.error}")
+            elif not counted.capped:
+                if available < declared_csize:
+                    errors.append(f"{entry.name}: member data is truncated")
+                elif not counted.eof:
+                    if counted.fed == available:
+                        # We fed the directory-declared number of compressed
+                        # bytes and the stream still had not terminated.  A
+                        # stream-consuming extractor will read further bytes than
+                        # the metadata admits.
+                        short_streams.append(entry.name)
+                    else:
+                        errors.append(
+                            f"{entry.name}: compressed stream did not terminate"
+                        )
+                elif counted.unused_compressed:
+                    padded_streams.append(entry.name)
+
+            if entry.usize is not None:
+                if counted.total > entry.usize:
+                    understated.append((entry.name, entry.usize, counted.total))
+                elif counted.total < entry.usize and counted.eof:
+                    overstated.append((entry.name, entry.usize, counted.total))
+            if counted.capped or total >= budget:
+                capped = True
+                break
+    finally:
+        if decryptor is not None:
+            decryptor.close()
 
     if short_streams:
         findings.append(
@@ -225,10 +283,22 @@ def _verify_zip(
     if not complete:
         notes.append("static parse was partial, so verification cannot cover every member")
     if unsupported:
-        notes.append(
-            f"{unsupported} member(s) use encryption or a method this verifier "
-            "cannot decode"
-        )
+        if encrypted_skipped and decrypt_error:
+            notes.append(
+                f"{encrypted_skipped} encrypted member(s) were not verified: "
+                f"{decrypt_error}"
+            )
+        elif encrypted_skipped and limits.password is None:
+            notes.append(
+                f"{encrypted_skipped} encrypted member(s) were skipped; supply "
+                "a password to verify them"
+            )
+        undecodable = unsupported - encrypted_skipped
+        if undecodable:
+            notes.append(
+                f"{undecodable} member(s) use a compression method this "
+                "verifier cannot decode"
+            )
 
     verified = (
         complete

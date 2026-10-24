@@ -3,9 +3,10 @@
 ## The uncomfortable truth
 
 **No archive scanner can prove an upload is safe.** ZIP bombs are valid
-archives. Headers can understate sizes. Encrypted data cannot be inspected.
-Decompression libraries have bugs. If your web process opens and extracts a
-user's archive, the attacker's input is running on your infrastructure.
+archives. Headers can understate sizes. Encrypted data cannot be inspected
+without its password. Decompression libraries have bugs. If your web process
+opens and extracts a user's archive, the attacker's input is running on your
+infrastructure.
 
 `zipcheck` is therefore a **cheap pre-flight gate**, not the security boundary.
 The boundary is an isolated extraction worker with hard OS quotas, followed by
@@ -27,7 +28,7 @@ With static analysis only:
   inside complete nested images;
 - ❌ **cannot** detect a ZIP whose forged stream is arranged to look contiguous,
   or whose declared sizes exceed the stream-tail probe caps;
-- ❌ cannot inspect AES/ZipCrypto payloads;
+- ❌ cannot inspect AES/ZipCrypto payloads unless a password is supplied;
 - ❌ cannot inspect 7z/RAR data without a decoder.
 
 With `--verify`:
@@ -41,7 +42,10 @@ With `--verify`:
   with a shared 256 MiB nested-output budget;
 - ✅ reports `VERIFICATION_LIMIT` when the cap is reached;
 - ✅ feeds the measured output into the same expansion policy;
-- ❌ still cannot decode 7z, RAR, Zstandard or encrypted members;
+- ✅ decrypts AES/ZipCrypto ZIP members when a password is supplied, so nested
+  encrypted bombs are followed and counted;
+- ❌ still cannot decode 7z, RAR, Zstandard or encrypted members without a
+  password;
 - ❌ does not fully verify nested members larger than the capture cap (they are
   probed and marked unverified);
 - ❌ still consumes CPU up to the timeout and output cap;
@@ -100,6 +104,9 @@ service.
 - Allowlist only the formats your product actually needs. Every extra format is
   another parser and another attack surface.
 - Reject encrypted archives unless the product has a deliberate flow for them.
+  If it does, feed the password to zipcheck through `--password-file` (a
+  short-lived secret) or `--ask-password`; never put it in argv, an environment
+  dump, or the scan report.
 - Rate-limit per account/IP and put uploads on a queue.
 
 ### 2. Pre-flight scan
@@ -204,7 +211,7 @@ p99 scan durations. A sudden increase in `unknown` is a signal, not noise.
 
 | Format | Static | `--verify` | Production note |
 |---|---|---|---|
-| ZIP/ZIP64 | yes | deflate, stored, bzip2, lzma + nested images (≤8 MiB) | reject AES/ZipCrypto unless decrypted in worker |
+| ZIP/ZIP64 | yes | deflate, stored, bzip2, lzma + nested images (≤8 MiB) | supply a ZIP password (`--password-file`) to verify AES/ZipCrypto; without one encrypted members fail closed |
 | TAR | yes | declared plan + nested members (≤8 MiB) | sparse holes need filesystem quota; reject devices/symlinks |
 | gzip | probe | all members + nested images (≤8 MiB) | bounded probe counts every member; forged or truncated trailers fail closed |
 | bzip2 | probe | yes | exact size measured |
@@ -225,7 +232,8 @@ zipcheck is production-ready as:
 - a fast rejection gate for obvious bombs;
 - a metadata auditor for ZIP/TAR/gzip/bzip2/xz;
 - a bounded verifier for forged ZIP/gzip metadata within the supported methods,
-  including recursively nested archives under the capture cap;
+  including recursively nested archives under the capture cap and encrypted ZIP
+  members when the password is supplied;
 - a source of machine-readable evidence for your decision log.
 
 It is **not** production-ready as:

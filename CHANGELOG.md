@@ -6,6 +6,28 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-25
+
+### Added
+
+- Password support for encrypted ZIPs: `--password`, `--password-file` and
+  `--ask-password` decrypt WinZip AES and legacy ZipCrypto members during the
+  scan, so nested encrypted bombs are followed and reported instead of landing
+  in `unknown`.
+- Password-aware content verification: encrypted ZIP members are decrypted into
+  the counting sink and participate in the understated/overstated and
+  `VERIFIED_EXPANSION` checks.
+- Optional `aes` extra (`pyzipper`) for AES decryption; ZipCrypto works with the
+  standard library alone. The bundled Docker image installs the extra, and the
+  AUR package lists `python-pyzipper` as an optional dependency.
+
+### Security
+
+- Passwords are kept out of `Limits` representations, findings, notes and JSON
+  output.
+- A wrong password, a missing AES backend, or an unsupported encryption method
+  fails closed: `unknown` in static mode, unverified under `--production`.
+
 ## [0.2.0] - 2026-10-24
 
 ### Added
@@ -62,7 +84,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - A 7-level nested chain no longer scans `clean` when the depth limit truncates
   inspection.
 
-[Unreleased]: https://github.com/spaxe-dev/zipcheck/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/spaxe-dev/zipcheck/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/spaxe-dev/zipcheck/releases/tag/v0.3.0
 [0.2.0]: https://github.com/spaxe-dev/zipcheck/releases/tag/v0.2.0
 
 ## [0.1.0] - 2026-10-24
