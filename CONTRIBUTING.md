@@ -7,14 +7,15 @@ Thanks for helping make archive handling less exciting.
 ```bash
 git clone <this repository>
 cd zipcheck
-python -m pip install -e .[dev]
+python -m pip install -e ".[dev]"
 python -m pytest
 ruff check src tests tools
+mypy src/zipcheck
 ```
 
-Python 3.9+ is required. Runtime code must stay dependency-free; optional
-extras (for example `zstandard`) belong in `pyproject.toml` under an extra and
-must degrade gracefully when absent.
+Python 3.10+ is required. Runtime code must stay dependency-free; if a feature
+ever needs a third-party package, put it in an optional extra and make the
+feature degrade gracefully when that extra is not installed.
 
 ## Ground rules
 
@@ -63,9 +64,39 @@ For integration testing against real bombs, use `tools/generate_samples.py`
 inside a disposable VM/container. The generated files are small on disk but
 enormous when extracted.
 
+## Fuzzing
+
+Hypothesis property tests run with the normal suite. The coverage-guided
+Atheris harness is Linux-only:
+
+```bash
+python -m pip install -e .[fuzz]
+python fuzz/generate_seeds.py fuzz/corpus
+python fuzz/fuzz_scan.py fuzz/corpus -max_total_time=120
+```
+
+The weekly `fuzz` workflow runs the same harness and uploads crashing inputs.
+
+## Releasing
+
+1. Bump `__version__` in `src/zipcheck/__init__.py`; the package version is read
+   from that attribute. Add a `CHANGELOG.md` entry.
+2. Run the full gate: `pytest`, `mypy src/zipcheck`, `ruff check src tests tools`,
+   `python -m build` and `twine check dist/*`.
+3. Commit, then tag and push `vX.Y.Z`. `.github/workflows/release.yml` builds and
+   smoke-tests the sdist/wheel, publishes to PyPI through OIDC trusted
+   publishing, and creates a GitHub release.
+4. One-time setup: register a trusted publisher on PyPI for owner `spaxe-dev`,
+   repository `zipcheck`, workflow `release.yml`, environment `pypi`; create the
+   same `pypi` environment in the GitHub repository.
+5. For AUR, wait for the GitHub release, update `pkgver` and checksums in
+   `packaging/aur/PKGBUILD`, then run `updpkgsums` and
+   `makepkg --printsrcinfo > .SRCINFO` before pushing to the AUR repository.
+
 ## Style
 
 - `ruff check src tests tools` must pass.
+- `mypy src/zipcheck` must pass.
 - Line length 100.
 - Type hints on public functions.
 - Comments explain *why*, not *what*.

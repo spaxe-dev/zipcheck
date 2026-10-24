@@ -1,0 +1,43 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  atheris:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[fuzz]"
+      - name: Generate seed corpus
+        run: python fuzz/generate_seeds.py fuzz/corpus
+      - name: Fuzz
+        run: |
+          python fuzz/fuzz_scan.py fuzz/corpus \
+            -max_total_time=120 \
+            -max_len=1048576 \
+            -print_final_stats=1
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+            leak-*
+          if-no-files-found: ignore

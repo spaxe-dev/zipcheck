@@ -78,10 +78,18 @@ def decompress_prefix(
         chunk = fp.read(64 * 1024)
         if not chunk:
             break
-        try:
-            out.extend(decompressor.decompress(chunk, cap - len(out)))
-        except OSError:
-            break
-        if decompressor.eof:
-            break
+        data = chunk
+        while len(out) < cap:
+            try:
+                produced = decompressor.decompress(data, cap - len(out))
+            except OSError:
+                return bytes(out)
+            out.extend(produced)
+            if decompressor.eof:
+                return bytes(out)
+            if decompressor.needs_input:
+                break
+            data = b""
+            if not produced:
+                break
     return bytes(out)

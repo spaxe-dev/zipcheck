@@ -1,0 +1,29 @@
+# Maintainer: Spaxe <182298766+spaxe-dev@users.noreply.github.com>
+pkgname=zipcheck
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Static archive-bomb scanner that never extracts anything"
+arch=('any')
+url="https://github.com/spaxe-dev/zipcheck"
+license=('MIT')
+depends=('python')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+checkdepends=('python-hypothesis' 'python-pytest')
+source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-$pkgver.tar.gz")
+sha256sums=('SKIP') # run updpkgsums after the PyPI release exists
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  python -m pytest -q
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

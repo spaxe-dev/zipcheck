@@ -113,7 +113,12 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
 def decompress_prefix(
     fp: BinaryIO, size: int, cap: int, deadline: Deadline
 ) -> bytes:
-    """Return at most ``cap`` decompressed bytes (first member), in memory."""
+    """Return at most ``cap`` decompressed bytes across all members, in memory.
+
+    gzip concatenation is defined as the concatenation of member payloads, so a
+    valid TAR or ZIP may span several members.  Stopping at the first member
+    would hide a nested archive split across members.
+    """
     decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
     fp.seek(0)
     out = bytearray()
@@ -122,10 +127,17 @@ def decompress_prefix(
         chunk = fp.read(64 * 1024)
         if not chunk:
             break
-        try:
-            out.extend(decompressor.decompress(chunk, cap - len(out)))
-        except zlib.error:
-            break
-        if decompressor.eof:
-            break
+        data = chunk
+        while data and len(out) < cap:
+            try:
+                out.extend(decompressor.decompress(data, cap - len(out)))
+            except zlib.error:
+                return bytes(out)
+            if decompressor.eof:
+                data = decompressor.unused_data
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                if not data:
+                    break
+                continue
+            data = b""
     return bytes(out)

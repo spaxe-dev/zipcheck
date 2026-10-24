@@ -1,0 +1,10 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include Dockerfile
+include SECURITY.md
+include .dockerignore
+recursive-include docs *.md
+recursive-include fuzz *.py
+recursive-include packaging *
+recursive-include tests *.py
+recursive-include tools *.py

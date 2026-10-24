@@ -116,6 +116,90 @@ def build_overlap_zip(path):
     return path
 
 
+def forged_zip_sizes(path, usize=1, csize=1):
+    """Rewrite the first member's local and central sizes to ``usize``/``csize``.
+
+    The encoded stream is left untouched, so this simulates an attacker who
+    understates metadata while shipping much more real data.
+    """
+    data = bytearray(path.read_bytes())
+    central = data.rfind(b"PK\x01\x02")
+    if central < 0:
+        raise ValueError("central directory not found")
+    struct.pack_into("<I", data, 18, csize)
+    struct.pack_into("<I", data, 22, usize)
+    struct.pack_into("<I", data, central + 20, csize)
+    struct.pack_into("<I", data, central + 24, usize)
+    path.write_bytes(data)
+    return path
+
+
+def build_forged_bomb_zip(path, size=32 * 1024 * 1024):
+    """A real DEFLATE bomb whose local and central headers claim one byte."""
+    make_zip_bomb(path, size=size)
+    return forged_zip_sizes(path)
+
+
+def build_header_mismatch_zip(path, local_usize=3 * 1024**3):
+    """A clean archive whose local header claims a different size than the CD."""
+    make_zip(path, {"a.txt": b"hello"})
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<I", data, 22, local_usize)
+    path.write_bytes(data)
+    return path
+
+
+def build_encryption_flag_mismatch_zip(path):
+    """Local header says encrypted; the central directory says plaintext."""
+    make_zip(path, {"a.txt": b"hello"})
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<H", data, 6, 1)
+    path.write_bytes(data)
+    return path
+
+
+def build_hidden_cd_entries_zip(path):
+    """Two central-directory entries behind an EOCD that counts only one."""
+    make_zip(path, {"a.txt": b"a", "b.txt": b"b"})
+    data = bytearray(path.read_bytes())
+    eocd = data.rfind(b"PK\x05\x06")
+    if eocd < 0:
+        raise ValueError("EOCD not found")
+    struct.pack_into("<H", data, eocd + 8, 1)
+    struct.pack_into("<H", data, eocd + 10, 1)
+    path.write_bytes(data)
+    return path
+
+
+def build_nested_forged_bomb_zip(path, size=32 * 1024 * 1024):
+    """A stored outer ZIP containing a forged-size bomb.
+
+    Static metadata looks small at every level; only content verification
+    reveals the inner bomb.
+    """
+    inner = build_forged_bomb_zip(path.with_name("inner-" + path.name), size=size)
+    return make_zip(path, {"inner.zip": inner.read_bytes()}, method=zipfile.ZIP_STORED)
+
+
+def build_gzip_with_nested_bomb(path, size=32 * 1024 * 1024):
+    """A gzip stream wrapping a forged-size ZIP bomb."""
+    inner = build_forged_bomb_zip(path.with_name("inner-" + path.name), size=size)
+    with gzip.open(path, "wb", compresslevel=9) as handle:
+        handle.write(inner.read_bytes())
+    return path
+
+
+def build_split_gzip_with_nested_bomb(path, size=32 * 1024 * 1024):
+    """A nested bomb split across two concatenated gzip members."""
+    inner = build_forged_bomb_zip(path.with_name("inner-" + path.name), size=size)
+    data = inner.read_bytes()
+    middle = len(data) // 2
+    with open(path, "wb") as handle:
+        handle.write(gzip.compress(data[:middle], 9))
+        handle.write(gzip.compress(data[middle:], 9))
+    return path
+
+
 def build_encrypted_archive_member_zip(path):
     """An encrypted ZIP whose member is itself named like an archive."""
     name = "lib0.zip"

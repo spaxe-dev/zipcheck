@@ -8,7 +8,7 @@ disk.  This is a *measurement*, not extraction.
 
 from __future__ import annotations
 
-from typing import BinaryIO, Callable, Tuple
+from typing import Any, BinaryIO, Callable, Tuple
 
 from ..reader import Deadline
 
@@ -16,7 +16,7 @@ from ..reader import Deadline
 def bounded_probe(
     fp: BinaryIO,
     offset: int,
-    factory: Callable[[], object],
+    factory: Callable[[], Any],
     cap: int,
     deadline: Deadline,
     chunk_size: int = 64 * 1024,
@@ -44,7 +44,7 @@ def bounded_probe(
             break
         consumed += len(chunk)
         try:
-            produced = decompressor.decompress(chunk, cap - output)  # type: ignore[call-arg]
+            produced = decompressor.decompress(chunk, cap - output)
         except Exception:
             break
         output += len(produced)

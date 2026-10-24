@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Check tag matches package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          import os
+          import zipcheck
+
+          expected = "v" + zipcheck.__version__
+          assert os.environ["TAG"] == expected, f"tag {os.environ['TAG']} != {expected}"
+          PY
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Test and lint
+        run: |
+          ruff check src tests tools fuzz
+          mypy src/zipcheck
+          python -m pytest
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+      - name: Smoke-test the wheel
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/pip install dist/*.whl
+          .venv-wheel/bin/zipcheck --version
+          python - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("sample.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.writestr("hello.txt", b"hello" * 100)
+          PY
+          .venv-wheel/bin/zipcheck --production sample.zip
+      - name: Smoke-test the sdist
+        run: |
+          python -m venv .venv-sdist
+          .venv-sdist/bin/pip install dist/*.tar.gz
+          .venv-sdist/bin/zipcheck --version
+          .venv-sdist/bin/zipcheck sample.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/zipcheck/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/*

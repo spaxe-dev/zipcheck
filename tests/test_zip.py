@@ -3,10 +3,14 @@ from __future__ import annotations
 import zipfile
 
 from zipcheck import Limits, scan_file
+from zipcheck.formats import zipfmt
 from zipcheck.model import Severity
 
 from .helpers import (
     build_encrypted_archive_member_zip,
+    build_encryption_flag_mismatch_zip,
+    build_header_mismatch_zip,
+    build_hidden_cd_entries_zip,
     build_overlap_zip,
     build_single_entry_zip,
     build_zip_with_zip64_size,
@@ -142,3 +146,49 @@ def test_directory_entry_is_ignored_for_ratio(tmp_path):
     result = scan_file(str(path))
     assert result.verdict == "clean"
     assert result.entry_count == 2
+
+
+def test_local_header_mismatch_is_dangerous(tmp_path):
+    path = build_header_mismatch_zip(tmp_path / "mismatch.zip")
+    result = scan_file(str(path))
+    codes = {f.code for f in result.findings}
+    assert result.verdict == "dangerous"
+    assert "HEADER_MISMATCH" in codes
+
+
+def test_encryption_flag_mismatch_is_dangerous(tmp_path):
+    path = build_encryption_flag_mismatch_zip(tmp_path / "flags.zip")
+    result = scan_file(str(path))
+    codes = {f.code for f in result.findings}
+    assert result.verdict == "dangerous"
+    assert "HEADER_MISMATCH" in codes
+
+
+def test_entry_parse_limit_is_not_reported_as_hidden_entries(tmp_path):
+    path = make_zip(tmp_path / "two.zip", {"a.txt": b"a", "b.txt": b"b"})
+    result = scan_file(str(path), Limits(max_entries_parse=1))
+    finding = next(
+        f for f in result.findings if f.code == "ENTRY_COUNT_MISMATCH"
+    )
+    assert finding.severity == Severity.MEDIUM
+    assert result.verdict == "suspicious"
+
+
+def test_hidden_central_directory_entries_are_dangerous(tmp_path):
+    path = build_hidden_cd_entries_zip(tmp_path / "hidden.zip")
+    result = scan_file(str(path))
+    codes = {f.code for f in result.findings}
+    assert result.verdict == "dangerous"
+    assert "ENTRY_COUNT_MISMATCH" in codes
+    assert result.entry_count == 2
+    assert result.complete is False
+
+
+def test_truncated_zip_prefix_reads_local_header_fields(tmp_path):
+    path = build_single_entry_zip(tmp_path / "tiny.zip", usize=3 * 1024**3)
+    facts = zipfmt.parse_prefix(path.read_bytes()[:60], Limits())
+    assert facts.entries[0].usize == 3 * 1024**3
+    assert facts.entries[0].csize is not None
+    assert facts.entries[0].csize < 60
+    assert facts.entries[0].name == "bomb.bin"
+    assert facts.complete is False

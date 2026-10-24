@@ -79,7 +79,7 @@ def _scan_lzma(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> F
     head = read_at(fp, 0, 13)
     if len(head) < 13 or not head.startswith(LZMA_MAGIC):
         raise FormatError("not an LZMA-alone stream")
-    declared = u64le(head, 5)
+    declared: Optional[int] = u64le(head, 5)
     notes: List[str] = []
     measured = False
     capped = False
@@ -153,10 +153,18 @@ def decompress_prefix(
         chunk = fp.read(64 * 1024)
         if not chunk:
             break
-        try:
-            out.extend(decompressor.decompress(chunk, cap - len(out)))
-        except lzma.LZMAError:
-            break
-        if decompressor.eof:
-            break
+        data = chunk
+        while len(out) < cap:
+            try:
+                produced = decompressor.decompress(data, cap - len(out))
+            except lzma.LZMAError:
+                return bytes(out)
+            out.extend(produced)
+            if decompressor.eof:
+                return bytes(out)
+            if decompressor.needs_input:
+                break
+            data = b""
+            if not produced:
+                break
     return bytes(out)

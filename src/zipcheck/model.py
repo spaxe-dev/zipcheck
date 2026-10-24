@@ -125,6 +125,11 @@ class ScanResult:
     complete: bool = True
     depth: int = 0
     duration_ms: float = 0.0
+    verified: Optional[bool] = None
+    verified_uncompressed: Optional[int] = None
+    verification_capped: bool = False
+    verification_detail: str = ""
+    nested_unverified: bool = False
 
     @property
     def ratio(self) -> Optional[float]:
@@ -172,6 +177,11 @@ class ScanResult:
             "severity_value": int(self.severity),
             "complete": self.complete,
             "error": self.error,
+            "verified": self.verified,
+            "verified_uncompressed": self.verified_uncompressed,
+            "verification_capped": self.verification_capped,
+            "verification_detail": self.verification_detail,
+            "nested_unverified": self.nested_unverified,
             "notes": self.notes,
             "entries": [e.to_dict() for e in entries],
             "entries_truncated": len(self.entries) > sample_entries,

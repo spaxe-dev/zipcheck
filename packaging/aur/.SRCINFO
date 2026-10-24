@@ -1,0 +1,18 @@
+pkgbase = zipcheck
+	pkgdesc = Static archive-bomb scanner that never extracts anything
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/spaxe-dev/zipcheck
+	arch = any
+	license = MIT
+	checkdepends = python-hypothesis
+	checkdepends = python-pytest
+	depends = python
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-setuptools
+	makedepends = python-wheel
+	source = zipcheck-0.1.0.tar.gz::https://files.pythonhosted.org/packages/source/z/zipcheck/zipcheck-0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = zipcheck

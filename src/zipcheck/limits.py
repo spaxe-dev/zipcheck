@@ -26,12 +26,22 @@ class Limits:
     max_nested_archives: int = 128
     max_nested_compressed: int = 8 * 1024 * 1024
     nested_prefix_bytes: int = 1024 * 1024
+    nested_capture_bytes: int = 8 * 1024 * 1024
     nested_budget_bytes: int = 64 * 1024 * 1024
     max_decoder_memory: int = 128 * 1024 * 1024
 
     # --- bounded decompression probe (only formats with no declared size) ---
     probe: bool = True
     probe_limit: int = 64 * 1024 * 1024
+
+    # --- content verification: actually decompress into a counting sink ---
+    verify: bool = False
+    verify_limit: int = 512 * 1024 * 1024
+    # Output budget for recursively verifying archives found *inside* another
+    # archive.  Kept separate so a large outer archive cannot starve the deep
+    # scan (and so the total work remains bounded).
+    nested_verify_limit: int = 256 * 1024 * 1024
+    require_verified: bool = False
 
     # --- verdict policy ---
     min_expansion_bytes: int = 16 * 1024 * 1024

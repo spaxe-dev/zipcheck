@@ -9,9 +9,11 @@ output cap and never written to disk.
 from __future__ import annotations
 
 import bz2
+import lzma
 import struct
 import zlib
-from typing import BinaryIO, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, BinaryIO, List, Optional, Tuple
 
 from ..limits import Limits
 from ..model import EntryInfo, Facts, Finding, Severity
@@ -52,6 +54,17 @@ BZIP2_METHOD = 12
 FLAG_ENCRYPTED = 0x0001
 FLAG_DATA_DESCRIPTOR = 0x0008
 FLAG_UTF8 = 0x0800
+
+# Only the ZIP64 field is needed from a local extra area; cap the read so a
+# header cannot force a large allocation or I/O per entry.
+LOCAL_EXTRA_READ = 64 * 1024
+
+_HIGH_RISK_MISMATCHES = {
+    "compression method",
+    "uncompressed size",
+    "compressed size",
+    "encryption flag",
+}
 
 
 def _decode_name(raw: bytes, flags: int) -> str:
@@ -186,24 +199,23 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
     else:
         delta = 0
 
-    parse_count = min(int(total_entries), limits.max_entries_parse)
-    if total_entries > parse_count:
-        notes.append(
-            f"only the first {parse_count} of {total_entries} entries were parsed; "
-            "totals are partial"
-        )
-
+    # The EOCD entry count is attacker-controlled.  Parse the central
+    # directory to its declared end (bounded), not just to the advertised
+    # count: hiding extra entries behind a small EOCD is a known bypass.
+    declared_total = int(total_entries)
     entries: List[EntryInfo] = []
     data_ranges: List[Tuple[int, int, str]] = []
     local_offsets: dict = {}
+    header_mismatches: List[dict] = []
+    high_risk_mismatch = False
     total_usize = 0
     total_csize = 0
     encrypted = 0
     lzma_entries = 0
     parsed = 0
-    complete = parse_count == total_entries and cd_size <= limits.max_cd_bytes
+    complete = cd_size <= limits.max_cd_bytes
 
-    while parsed < parse_count and cd_reader.remaining() >= 46:
+    while parsed < limits.max_entries_parse and cd_reader.remaining() >= 46:
         if parsed % 1024 == 0:
             deadline.check()
         start = cd_reader.pos
@@ -264,30 +276,58 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
             lzma_entries += 1
 
         adjusted_local = local_offset + delta
-        data_offset = _local_data_offset(fp, adjusted_local, size, limits)
-        if data_offset is None:
+        local = _parse_local_header(fp, adjusted_local, size, limits)
+        data_offset: Optional[int] = None
+        if local is None:
             notes.append(f"entry {name!r} has an invalid local header offset")
             complete = False
-        elif csize > 0 and not is_dir:
-            end = data_offset + csize
-            if end > size:
-                notes.append(f"entry {name!r} declares data past end of file")
-            data_ranges.append((data_offset, end, name))
-            if adjusted_local in local_offsets and csize > 0:
-                findings.append(
-                    Finding(
-                        code="OVERLAPPING_ENTRIES",
-                        severity=Severity.HIGH,
-                        title="Multiple entries share one local header",
-                        detail=(
-                            f"Entries {local_offsets[adjusted_local]!r} and {name!r} "
-                            "point at the same local header. This is a classic "
-                            "non-recursive ZIP-bomb technique."
-                        ),
-                        evidence={"entries": [local_offsets[adjusted_local], name]},
-                    )
+        else:
+            data_offset = local.data_offset
+            if local.usize is None or local.csize is None:
+                notes.append(f"entry {name!r} has unresolved ZIP64 local sizes")
+                complete = False
+            conflicts = _header_conflicts(
+                local, flags, method_id, csize, usize, name_raw
+            )
+            if conflicts:
+                header_mismatches.append(
+                    {
+                        "name": name,
+                        "fields": conflicts,
+                        "central": {
+                            "usize": usize,
+                            "csize": csize,
+                            "method": method_id,
+                        },
+                        "local": {
+                            "usize": local.usize,
+                            "csize": local.csize,
+                            "method": local.method,
+                        },
+                    }
                 )
-            local_offsets[adjusted_local] = name
+                if any(kind in _HIGH_RISK_MISMATCHES for kind in conflicts):
+                    high_risk_mismatch = True
+            if csize > 0 and not is_dir:
+                end = data_offset + csize
+                if end > size:
+                    notes.append(f"entry {name!r} declares data past end of file")
+                data_ranges.append((data_offset, end, name))
+                if adjusted_local in local_offsets:
+                    findings.append(
+                        Finding(
+                            code="OVERLAPPING_ENTRIES",
+                            severity=Severity.HIGH,
+                            title="Multiple entries share one local header",
+                            detail=(
+                                f"Entries {local_offsets[adjusted_local]!r} and {name!r} "
+                                "point at the same local header. This is a classic "
+                                "non-recursive ZIP-bomb technique."
+                            ),
+                            evidence={"entries": [local_offsets[adjusted_local], name]},
+                        )
+                    )
+                local_offsets[adjusted_local] = name
 
         entry = EntryInfo(
             name=name,
@@ -351,8 +391,101 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
                 )
             )
 
-    if parsed == 0 and total_entries:
+    if parsed == 0 and (declared_total or cd_size):
         raise FormatError("no central-directory entries could be parsed")
+
+    if header_mismatches:
+        findings.append(
+            Finding(
+                code="HEADER_MISMATCH",
+                severity=(
+                    Severity.HIGH if high_risk_mismatch else Severity.MEDIUM
+                ),
+                title="Local header disagrees with the central directory",
+                detail=(
+                    f"{len(header_mismatches)} member(s) advertise different "
+                    "metadata in the local header and the central directory. "
+                    "Extractors disagree on which copy is authoritative, so the "
+                    "declared totals cannot be trusted."
+                ),
+                evidence={
+                    "count": len(header_mismatches),
+                    "samples": header_mismatches[:5],
+                },
+            )
+        )
+
+    remaining_cd = cd_reader.remaining()
+    # Leftover CD bytes only mean "hidden" when the EOCD count is *lower* than
+    # what was parsed.  Stopping at the entry cap with more declared entries is
+    # truncation, not an understated count.
+    hidden_entries = (
+        remaining_cd >= 4
+        and cd_reader.data[cd_reader.pos : cd_reader.pos + 4] == CD_SIG
+        and parsed >= declared_total
+        and parsed < limits.max_entries_parse
+    )
+    if hidden_entries:
+        complete = False
+        findings.append(
+            Finding(
+                code="ENTRY_COUNT_MISMATCH",
+                severity=Severity.HIGH,
+                title="Central directory contains entries the EOCD does not count",
+                detail=(
+                    "The end-of-central-directory record advertises "
+                    f"{declared_total} member(s), but the central directory "
+                    f"contains at least {parsed + 1}. Scanners that trust the "
+                    "count see less than an extractor that walks the directory."
+                ),
+                evidence={
+                    "declared_entries": declared_total,
+                    "parsed_entries": parsed,
+                    "directory_bytes_left": remaining_cd,
+                },
+            )
+        )
+    elif parsed > declared_total:
+        complete = False
+        findings.append(
+            Finding(
+                code="ENTRY_COUNT_MISMATCH",
+                severity=Severity.HIGH,
+                title="Central directory contains more entries than declared",
+                detail=(
+                    f"The EOCD advertises {declared_total} member(s) but "
+                    f"{parsed} were parsed. Hidden entries can change extraction "
+                    "behaviour between tools."
+                ),
+                evidence={
+                    "declared_entries": declared_total,
+                    "parsed_entries": parsed,
+                },
+            )
+        )
+    elif parsed < declared_total:
+        complete = False
+        if parsed >= limits.max_entries_parse:
+            notes.append(
+                f"central directory entry limit {limits.max_entries_parse} "
+                "reached; totals are partial"
+            )
+        findings.append(
+            Finding(
+                code="ENTRY_COUNT_MISMATCH",
+                severity=Severity.MEDIUM,
+                title="Central directory has fewer entries than declared",
+                detail=(
+                    f"The EOCD advertises {declared_total} member(s) but only "
+                    f"{parsed} could be parsed. The archive is truncated or its "
+                    "metadata is inconsistent."
+                ),
+                evidence={
+                    "declared_entries": declared_total,
+                    "parsed_entries": parsed,
+                },
+            )
+        )
 
     overlap = _find_overlap(data_ranges)
     if overlap:
@@ -425,7 +558,7 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
             )
         )
 
-    if not entries and total_entries == 0:
+    if not entries and declared_total == 0:
         notes.append("archive has no members")
 
     return Facts(
@@ -433,7 +566,7 @@ def scan(fp: BinaryIO, size: int, limits: Limits, deadline: Deadline) -> Facts:
         detail=f"ZIP, {len(entries)} parsed entries",
         declared_uncompressed=total_usize,
         declared_compressed=total_csize,
-        entry_count=int(total_entries),
+        entry_count=parsed,
         entries=entries,
         findings=findings,
         notes=notes,
@@ -457,22 +590,107 @@ def _find_zip64_eocd(fp: BinaryIO, eocd_pos: int, size: int) -> Optional[int]:
     return None
 
 
-def _local_data_offset(
+@dataclass
+class _LocalHeader:
+    data_offset: int
+    flags: int
+    method: int
+    csize: Optional[int]
+    usize: Optional[int]
+    name: bytes
+
+
+def _parse_local_header(
     fp: BinaryIO, local_offset: int, size: int, limits: Limits
-) -> Optional[int]:
+) -> Optional[_LocalHeader]:
     if local_offset < 0 or local_offset + 30 > size:
         return None
     header = read_at(fp, local_offset, 30)
     if len(header) < 30 or not header.startswith(LOCAL_SIG):
         return None
-    name_len = u16le(header, 26)
-    extra_len = u16le(header, 28)
-    if name_len > limits.max_name_bytes or extra_len > limits.max_header_bytes:
+    (
+        _version,
+        flags,
+        method_id,
+        _time,
+        _date,
+        _crc,
+        csize,
+        usize,
+        name_len,
+        extra_len,
+    ) = struct.unpack_from("<HHHHHIIIHH", header, 4)
+    if name_len > limits.max_name_bytes:
         return None
     data_offset = local_offset + 30 + name_len + extra_len
     if data_offset > size:
         return None
-    return data_offset
+    name = read_at(fp, local_offset + 30, name_len)
+    if len(name) < name_len:
+        return None
+
+    resolved_u: Optional[int] = usize
+    resolved_c: Optional[int] = csize
+    if usize == 0xFFFFFFFF or csize == 0xFFFFFFFF:
+        sentinel = []
+        if usize == 0xFFFFFFFF:
+            sentinel.append("usize")
+        if csize == 0xFFFFFFFF:
+            sentinel.append("csize")
+        extra = read_at(
+            fp,
+            local_offset + 30 + name_len,
+            min(extra_len, LOCAL_EXTRA_READ),
+        )
+        zvals, ok = _parse_zip64_extra(extra, sentinel)
+        if not ok:
+            resolved_u = resolved_c = None
+        else:
+            resolved_u = zvals.get("usize", usize)
+            resolved_c = zvals.get("csize", csize)
+            if resolved_u == 0xFFFFFFFF:
+                resolved_u = None
+            if resolved_c == 0xFFFFFFFF:
+                resolved_c = None
+    return _LocalHeader(
+        data_offset=data_offset,
+        flags=flags,
+        method=method_id,
+        csize=resolved_c,
+        usize=resolved_u,
+        name=name,
+    )
+
+
+def _header_conflicts(
+    local: _LocalHeader,
+    flags: int,
+    method_id: int,
+    csize: int,
+    usize: int,
+    name_raw: bytes,
+) -> List[str]:
+    conflicts: List[str] = []
+    if local.method != method_id:
+        conflicts.append("compression method")
+    if local.name != name_raw:
+        conflicts.append("member name")
+    if (local.flags ^ flags) & FLAG_ENCRYPTED:
+        conflicts.append("encryption flag")
+    if (local.flags ^ flags) & FLAG_DATA_DESCRIPTOR:
+        conflicts.append("data-descriptor flag")
+    # A data descriptor legitimately leaves the local sizes at zero.
+    descriptor_sizes = (
+        bool(flags & FLAG_DATA_DESCRIPTOR)
+        and local.csize == 0
+        and local.usize == 0
+    )
+    if not descriptor_sizes:
+        if local.usize is not None and local.usize != usize:
+            conflicts.append("uncompressed size")
+        if local.csize is not None and local.csize != csize:
+            conflicts.append("compressed size")
+    return conflicts
 
 
 def _find_overlap(
@@ -511,9 +729,18 @@ def parse_prefix(data: bytes, limits: Limits) -> Facts:
     while pos + 30 <= len(data) and len(entries) < limits.max_entries_parse:
         if data[pos : pos + 4] != LOCAL_SIG:
             break
-        (flags, method_id, _t, _d, _crc, csize, usize, name_len, extra_len) = (
-            struct.unpack_from("<HHHHIIIHH", data, pos + 4)
-        )
+        (
+            _version,
+            flags,
+            method_id,
+            _t,
+            _d,
+            _crc,
+            csize,
+            usize,
+            name_len,
+            extra_len,
+        ) = struct.unpack_from("<HHHHHIIIHH", data, pos + 4)
         name_start = pos + 30
         name_raw = data[name_start : name_start + name_len]
         extra = data[name_start + name_len : name_start + name_len + extra_len]
@@ -595,17 +822,171 @@ def parse_prefix(data: bytes, limits: Limits) -> Facts:
     )
 
 
+def _zip_lzma_stream(
+    fp: BinaryIO, csize: int, max_dict: int
+) -> Optional[Tuple[lzma.LZMADecompressor, int]]:
+    """Consume a ZIP LZMA entry header; return (decoder, payload bytes left)."""
+
+    header = fp.read(4)
+    if len(header) < 4:
+        return None
+    props_size = u16le(header, 2)
+    if props_size < 5 or props_size > 64 or 4 + props_size > csize:
+        return None
+    props = fp.read(props_size)
+    if len(props) < props_size:
+        return None
+    prop0 = props[0]
+    lc = prop0 % 9
+    rest = prop0 // 9
+    lp = rest % 5
+    pb = rest // 5
+    dict_size = int.from_bytes(props[1:5], "little")
+    if dict_size > max_dict:
+        return None
+    filters = [
+        {
+            "id": lzma.FILTER_LZMA1,
+            "lc": lc,
+            "lp": lp,
+            "pb": pb,
+            "dict_size": max(dict_size, 4096),
+        }
+    ]
+    try:
+        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
+    except (lzma.LZMAError, ValueError):
+        return None
+    return decoder, csize - 4 - props_size
+
+
+def member_probe(
+    fp: BinaryIO,
+    entry: EntryInfo,
+    cap: int,
+    max_input: int,
+    max_dict: int,
+    deadline: Deadline,
+) -> bytes:
+    """Read a small decompressed prefix without trusting ``csize`` as a bound.
+
+    Used only to identify archives that are too large to capture in full.
+    Compressed input and output are both capped.
+    """
+
+    if entry.data_offset is None or entry.encrypted or not entry.csize:
+        return b""
+    csize = entry.csize
+    fp.seek(entry.data_offset)
+    if entry.method == "stored":
+        return fp.read(min(cap, csize))
+
+    decompressor: Any
+    if entry.method == "deflate":
+        decompressor = zlib.decompressobj(-15)
+        remaining = min(csize, max_input)
+    elif entry.method == "bzip2":
+        decompressor = bz2.BZ2Decompressor()
+        remaining = min(csize, max_input)
+    elif entry.method == "lzma":
+        opened = _zip_lzma_stream(fp, csize, max_dict)
+        if opened is None:
+            return b""
+        decompressor, payload = opened
+        remaining = min(payload, max_input)
+    else:
+        return b""
+
+    out = bytearray()
+    while remaining > 0 and len(out) < cap:
+        deadline.check()
+        chunk = fp.read(min(64 * 1024, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        try:
+            produced = decompressor.decompress(chunk, cap - len(out))
+        except (zlib.error, OSError, ValueError):
+            break
+        out.extend(produced)
+        if getattr(decompressor, "eof", False):
+            break
+    return bytes(out)
+
+
+def member_image(
+    fp: BinaryIO,
+    size: int,
+    entry: EntryInfo,
+    cap: int,
+    max_compressed: int,
+    max_dict: int,
+    deadline: Deadline,
+) -> Tuple[bytes, bool]:
+    """Materialize a complete member image, bounded by ``cap``.
+
+    Returns ``(data, complete)``.  ``complete`` is only true when the member's
+    entire decompressed payload fits in ``cap`` and the compressed stream
+    actually terminated inside its declared range.
+    """
+
+    if entry.data_offset is None or entry.encrypted or not entry.csize:
+        return b"", False
+    csize = entry.csize
+    if csize > max_compressed or entry.data_offset + csize > size:
+        return b"", False
+    fp.seek(entry.data_offset)
+
+    if entry.method == "stored":
+        data = fp.read(min(cap, csize))
+        return data, csize <= cap and len(data) == csize
+
+    decompressor: Any
+    if entry.method == "deflate":
+        decompressor = zlib.decompressobj(-15)
+        remaining = csize
+    elif entry.method == "bzip2":
+        decompressor = bz2.BZ2Decompressor()
+        remaining = csize
+    elif entry.method == "lzma":
+        opened = _zip_lzma_stream(fp, csize, max_dict)
+        if opened is None:
+            return b"", False
+        decompressor, remaining = opened
+    else:
+        return b"", False
+
+    out = bytearray()
+    while remaining > 0 and len(out) < cap:
+        deadline.check()
+        chunk = fp.read(min(64 * 1024, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        try:
+            produced = decompressor.decompress(chunk, cap - len(out))
+        except (zlib.error, OSError, ValueError):
+            return bytes(out), False
+        out.extend(produced)
+        if getattr(decompressor, "eof", False):
+            return bytes(out), True
+        if getattr(decompressor, "unused_data", b""):
+            return bytes(out), True
+    return bytes(out), False
+
+
 def member_prefix(
     fp: BinaryIO,
     entry: EntryInfo,
     cap: int,
     max_compressed: int,
+    max_dict: int,
     deadline: Deadline,
 ) -> bytes:
     """Read at most ``cap`` decompressed bytes of one member, in memory.
 
     No output is written anywhere.  Compressed input is also capped.  Stored,
-    deflate and bzip2 members are supported; other methods return b"".
+    deflate, bzip2 and LZMA members are supported; other methods return b"".
     """
 
     if entry.data_offset is None or entry.encrypted or not entry.csize:
@@ -618,15 +999,23 @@ def member_prefix(
     if method == "stored":
         return fp.read(min(cap, csize))
 
+    decompressor: Any
     if method == "deflate":
         decompressor = zlib.decompressobj(-15)
+        remaining = min(csize, max_compressed)
     elif method == "bzip2":
         decompressor = bz2.BZ2Decompressor()
+        remaining = min(csize, max_compressed)
+    elif method == "lzma":
+        opened = _zip_lzma_stream(fp, csize, max_dict)
+        if opened is None:
+            return b""
+        decompressor, payload = opened
+        remaining = min(payload, max_compressed)
     else:
         return b""
 
     out = bytearray()
-    remaining = min(csize, max_compressed)
     while remaining > 0 and len(out) < cap:
         deadline.check()
         chunk = fp.read(min(64 * 1024, remaining))

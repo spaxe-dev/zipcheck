@@ -101,6 +101,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum bytes produced by a bounded probe (default: 64MiB)",
     )
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="decompress content into a counting sink to detect forged metadata",
+    )
+    parser.add_argument(
+        "--verify-limit",
+        type=_parse_size,
+        default=512 * 1024 * 1024,
+        help="maximum bytes produced by content verification (default: 512MiB)",
+    )
+    parser.add_argument(
+        "--require-verified",
+        action="store_true",
+        help="fail closed (unknown) when content cannot be verified; implies --verify",
+    )
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help=(
+            "fail-closed preset for user uploads: verify content and reject "
+            "archives that cannot be fully verified (implies --verify "
+            "--require-verified)"
+        ),
+    )
+    parser.add_argument(
         "--ratio",
         type=float,
         default=100.0,
@@ -156,9 +181,7 @@ def _colorize(text: str, color: str, enabled: bool) -> str:
     return f"{color}{text}{RESET}" if enabled else text
 
 
-def _print_result(
-    result: ScanResult, args: argparse.Namespace, color: bool, nested_shown: int = 0
-) -> None:
+def _print_result(result: ScanResult, args: argparse.Namespace, color: bool) -> None:
     indent = "  " * (result.depth + 1)
     verdict = result.verdict.upper()
     colored_verdict = _colorize(verdict, VERDICT_COLORS.get(result.verdict, ""), color)
@@ -173,6 +196,14 @@ def _print_result(
         )
     if result.entry_count is not None:
         print(f"{indent}  members:   {result.entry_count:,}")
+    if result.verified is not None:
+        state = "verified" if result.verified else "unverified"
+        if result.verification_capped:
+            state += " (cap reached)"
+        print(
+            f"{indent}  verify:    {state}, "
+            f"{human_size(result.verified_uncompressed)} produced - {result.verification_detail}"
+        )
     if result.error:
         print(f"{indent}  error:     {result.error}")
 
@@ -196,9 +227,9 @@ def _print_result(
                 f"({kind}, {human_ratio(entry.ratio)})"
             )
 
-    for child in result.nested:
-        if args.verbose or nested_shown < 1:
-            _print_result(child, args, color, nested_shown + 1)
+    for index, child in enumerate(result.nested):
+        if args.verbose or index == 0:
+            _print_result(child, args, color)
         else:
             child_verdict = _colorize(
                 child.verdict.upper(), VERDICT_COLORS.get(child.verdict, ""), color
@@ -246,6 +277,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         timeout=max(0.0, args.timeout),
         probe=args.probe,
         probe_limit=args.probe_limit,
+        verify=args.verify or args.require_verified or args.production,
+        verify_limit=args.verify_limit,
+        require_verified=args.require_verified or args.production,
         min_expansion_bytes=args.min_size,
         suspicious_ratio=args.ratio,
         dangerous_ratio=max(args.dangerous_ratio, args.ratio),

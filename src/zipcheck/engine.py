@@ -19,7 +19,7 @@ from .formats import (
     zipfmt,
     zstdfmt,
 )
-from .formats.zipfmt import member_prefix
+from .formats.zipfmt import member_image, member_prefix, member_probe
 from .limits import Limits
 from .model import (
     Facts,
@@ -29,6 +29,7 @@ from .model import (
     result_from_facts,
 )
 from .reader import Deadline, FormatError, ScanBudget, ScanTimeout, read_at
+from .verify import Verification, verify_archive
 
 PARSERS = {
     "zip": zipfmt.scan,
@@ -50,6 +51,7 @@ class _Context:
     deadline: Deadline
     nested_used: int = 0
     nested_archives: int = 0
+    nested_verify_used: int = 0
 
     def spend(self, amount: int) -> None:
         if self.nested_used + amount > self.limits.nested_budget_bytes:
@@ -61,21 +63,18 @@ def scan_file(path: str, limits: Optional[Limits] = None) -> ScanResult:
     """Scan one archive without extracting it.
 
     Only metadata regions are read.  Nested archives are decompressed by at
-    most ``limits.nested_prefix_bytes`` into memory and never written to disk.
+    most ``limits.nested_capture_bytes`` into memory and never written to disk.
     """
 
     limits = limits or Limits()
     started = time.monotonic()
-    try:
-        size = os.path.getsize(path)
-    except OSError as exc:
-        result = ScanResult(path=path, size=0, error=str(exc), unknown=True)
-        result.duration_ms = (time.monotonic() - started) * 1000
-        return result
-
+    size = 0
     context = _Context(limits=limits, deadline=Deadline(limits.timeout))
     try:
+        # Open first, then stat the same descriptor.  Statting a path before
+        # opening it allows a file swap between check and use.
         with open(path, "rb") as fp:
+            size = os.fstat(fp.fileno()).st_size
             result = _scan_stream(fp, size, path, context, depth=0)
     except ScanTimeout:
         result = ScanResult(
@@ -204,18 +203,150 @@ def _scan_stream(
             )
         except ScanBudget:
             result.notes.append("nested inspection stopped: budget exhausted")
+            if limits.verify:
+                result.nested_unverified = True
         except ScanTimeout:
             raise
         except (OSError, ValueError) as exc:
             result.notes.append(f"nested inspection failed: {exc}")
+            if limits.verify:
+                result.nested_unverified = True
     elif facts.entries:
         result.notes.append(
             f"nested inspection limited to depth {limits.max_depth}"
         )
+        if limits.verify:
+            result.nested_unverified = True
+
+    if limits.verify:
+        if depth == 0 or not truncated:
+            _run_verification(
+                fp, size, result, limits, context.deadline, context, depth
+            )
+        else:
+            result.verified = False
+            result.verification_detail = (
+                "nested archive was only partially captured"
+            )
+            result.notes.append(
+                "nested archive verification skipped: only a prefix was available"
+            )
 
     _apply_rules(result, facts, limits)
     _apply_nested_rules(result)
+    _apply_nested_verification(result, limits)
     return result
+
+
+def _run_verification(
+    fp: BinaryIO,
+    size: int,
+    result: ScanResult,
+    limits: Limits,
+    deadline: Deadline,
+    context: _Context,
+    depth: int,
+) -> None:
+    budget = limits.verify_limit
+    if depth > 0:
+        remaining = limits.nested_verify_limit - context.nested_verify_used
+        if remaining <= 0:
+            verification = Verification(
+                supported=True,
+                verified=False,
+                output_bytes=0,
+                declared_bytes=result.declared_uncompressed,
+                capped=True,
+                detail="nested verification budget exhausted",
+                findings=[
+                    Finding(
+                        code="VERIFICATION_LIMIT",
+                        severity=Severity.HIGH,
+                        title="Nested verification budget exhausted",
+                        detail=(
+                            "Deep verification stopped before this nested "
+                            "archive could be measured. Its true expansion is "
+                            "unknown; treat it as dangerous."
+                        ),
+                        evidence={
+                            "nested_verify_limit": limits.nested_verify_limit,
+                        },
+                    )
+                ],
+                notes=["nested archive content was not verified"],
+            )
+            _finish_verification(verification, result, limits)
+            return
+        budget = min(budget, remaining)
+
+    try:
+        verification = verify_archive(
+            fp, size, result, limits, deadline, budget=budget
+        )
+    except ScanTimeout:
+        raise
+    except Exception as exc:  # fail closed: never trust an unverified archive
+        result.unknown = True
+        verification = Verification(
+            supported=False,
+            verified=False,
+            output_bytes=0,
+            declared_bytes=result.declared_uncompressed,
+            capped=False,
+            detail=f"verification failed: {exc}",
+            findings=[
+                Finding(
+                    code="VERIFICATION_FAILED",
+                    severity=Severity.MEDIUM,
+                    title="Content verification failed",
+                    detail=(
+                        "The verifier could not complete; the archive must not "
+                        "be treated as verified."
+                    ),
+                    evidence={"error": str(exc)},
+                )
+            ],
+            notes=[
+                "content verification raised an error; treat the result as unverified"
+            ],
+        )
+    if depth > 0:
+        context.nested_verify_used += verification.output_bytes
+    _finish_verification(verification, result, limits)
+
+
+def _finish_verification(
+    verification: Verification, result: ScanResult, limits: Limits
+) -> None:
+    result.verified = verification.verified
+    result.verified_uncompressed = verification.output_bytes
+    result.verification_capped = verification.capped
+    result.verification_detail = verification.detail
+    result.findings.extend(verification.findings)
+    result.notes.extend(verification.notes)
+
+    if not verification.verified:
+        codes = {f.code for f in result.findings}
+        if "UNVERIFIED" not in codes:
+            result.findings.append(
+                Finding(
+                    code="UNVERIFIED",
+                    severity=Severity.MEDIUM,
+                    title="Archive could not be fully content-verified",
+                    detail=(
+                        f"{verification.detail}. Verification was requested but "
+                        "did not cover the whole archive; do not treat it as "
+                        "clean."
+                    ),
+                    evidence={
+                        "verified": verification.verified,
+                        "supported": verification.supported,
+                        "capped": verification.capped,
+                    },
+                )
+            )
+        if limits.require_verified:
+            result.unknown = True
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +552,43 @@ def _apply_nested_rules(result: ScanResult) -> None:
             )
 
 
+def _apply_nested_verification(result: ScanResult, limits: Limits) -> None:
+    """Fail closed when any nested archive was not fully verified."""
+
+    if not limits.verify:
+        return
+    unverified = result.nested_unverified or any(
+        child.verified is not True for child in result.nested
+    )
+    if not unverified:
+        return
+
+    result.nested_unverified = True
+    result.verified = False
+    if not result.verification_detail:
+        result.verification_detail = "one or more nested archives were not verified"
+    codes = {f.code for f in result.findings}
+    if "UNVERIFIED" not in codes:
+        result.findings.append(
+            Finding(
+                code="UNVERIFIED",
+                severity=Severity.MEDIUM,
+                title="Nested archive content could not be verified",
+                detail=(
+                    "At least one archive nested inside this file was only "
+                    "partially inspected or could not be decoded. A bomb can be "
+                    "hidden at a deeper level, so the file must not be treated "
+                    "as verified."
+                ),
+                evidence={
+                    "nested_unverified": True,
+                },
+            )
+        )
+    if limits.require_verified:
+        result.unknown = True
+
+
 # ---------------------------------------------------------------------------
 # Nested inspection
 # ---------------------------------------------------------------------------
@@ -465,63 +633,138 @@ def _inspect_zip(
     children: List[ScanResult] = []
     examined = 0
     inspected = 0
+    capture_cap = (
+        limits.nested_capture_bytes
+        if limits.verify
+        else limits.nested_prefix_bytes
+    )
+
+    def mark_unverified(entry: object, why: str) -> None:
+        if limits.verify:
+            parent.nested_unverified = True
+            parent.notes.append(
+                f"nested archive {getattr(entry, 'name', '?')!r} not verified: {why}"
+            )
+
     for entry in facts.entries:
         if inspected >= limits.max_nested_candidates:
+            if limits.verify:
+                parent.nested_unverified = True
+                parent.notes.append(
+                    "nested candidate limit reached; not every member was inspected"
+                )
             break
         if examined >= limits.max_nested_candidates * 8:
+            if limits.verify:
+                parent.nested_unverified = True
+                parent.notes.append(
+                    "nested candidate scan limit reached; not every member was inspected"
+                )
             break
+        if entry.is_dir:
+            continue
+        archive_hint = detect.extension_suggests_archive(entry.name)
         if (
-            entry.is_dir
-            or entry.encrypted
+            entry.encrypted
             or not entry.csize
             or entry.data_offset is None
-            or entry.method not in ("stored", "deflate", "bzip2")
+            or entry.method not in ("stored", "deflate", "bzip2", "lzma")
         ):
+            if archive_hint:
+                mark_unverified(entry, "encrypted or unsupported compression method")
             continue
         if entry.csize > limits.max_nested_compressed:
+            if archive_hint:
+                mark_unverified(entry, "compressed member exceeds the nested scan cap")
+            elif limits.verify:
+                probe = member_probe(
+                    fp,
+                    entry,
+                    1024,
+                    limits.nested_prefix_bytes,
+                    limits.max_decoder_memory,
+                    context.deadline,
+                )
+                if detect.looks_like_archive(probe, ""):
+                    mark_unverified(
+                        entry,
+                        "archive is too large to capture for deep verification",
+                    )
             continue
         if entry.data_offset + entry.csize > size:
-            continue  # prefix does not contain the whole compressed member
+            if archive_hint:
+                mark_unverified(entry, "member data extends past the end of the file")
+            continue
         examined += 1
         context.deadline.check()
         try:
             head = member_prefix(
                 fp,
                 entry,
-                64,
+                1024 if limits.verify else 64,
                 limits.max_nested_compressed,
+                limits.max_decoder_memory,
                 context.deadline,
             )
         except (OSError, ValueError):
             continue
         if not detect.looks_like_archive(head, entry.name):
             continue
-        cap = min(
-            entry.usize if entry.usize is not None else limits.nested_prefix_bytes,
-            limits.nested_prefix_bytes,
-        )
-        if cap <= 0:
-            continue
         if context.nested_archives >= limits.max_nested_archives:
             parent.notes.append("nested archive limit reached; stopping inspection")
+            if limits.verify:
+                parent.nested_unverified = True
             break
-        if context.nested_used + cap > limits.nested_budget_bytes:
+        if context.nested_used >= limits.nested_budget_bytes:
             parent.notes.append("nested inspection budget reached; stopping inspection")
+            if limits.verify:
+                parent.nested_unverified = True
             break
-        try:
-            data = member_prefix(
+
+        if limits.verify:
+            data, complete = member_image(
                 fp,
+                size,
                 entry,
-                cap,
+                capture_cap,
                 limits.max_nested_compressed,
+                limits.max_decoder_memory,
                 context.deadline,
             )
-        except (OSError, ValueError):
-            continue
+            truncated = not complete
+            if not complete:
+                mark_unverified(
+                    entry, "member exceeds the nested verification capture cap"
+                )
+        else:
+            cap = min(
+                entry.usize
+                if entry.usize is not None
+                else limits.nested_prefix_bytes,
+                limits.nested_prefix_bytes,
+            )
+            if cap <= 0:
+                continue
+            if context.nested_used + cap > limits.nested_budget_bytes:
+                parent.notes.append(
+                    "nested inspection budget reached; stopping inspection"
+                )
+                break
+            try:
+                data = member_prefix(
+                    fp,
+                    entry,
+                    cap,
+                    limits.max_nested_compressed,
+                    limits.max_decoder_memory,
+                    context.deadline,
+                )
+            except (OSError, ValueError):
+                continue
+            truncated = entry.usize is not None and len(data) < entry.usize
         if not data:
             continue
         context.spend(len(data))
-        truncated = entry.usize is not None and len(data) < entry.usize
         child = _scan_bytes_nested(
             data,
             _nested_name(parent, entry.name),
@@ -547,11 +790,29 @@ def _inspect_tar(
     limits = context.limits
     children: List[ScanResult] = []
     inspected = examined = 0
+    capture_cap = (
+        limits.nested_capture_bytes
+        if limits.verify
+        else limits.nested_prefix_bytes
+    )
+
+    def mark_unverified(entry: object, why: str) -> None:
+        if limits.verify:
+            parent.nested_unverified = True
+            parent.notes.append(
+                f"nested archive {getattr(entry, 'name', '?')!r} not verified: {why}"
+            )
+
     for entry in facts.entries:
         if (
             inspected >= limits.max_nested_candidates
             or examined >= limits.max_nested_candidates * 8
         ):
+            if limits.verify:
+                parent.nested_unverified = True
+                parent.notes.append(
+                    "nested candidate limit reached; not every member was inspected"
+                )
             break
         if (
             entry.is_dir
@@ -559,23 +820,35 @@ def _inspect_tar(
             or entry.data_offset is None
             or not entry.usize
         ):
+            if detect.extension_suggests_archive(entry.name):
+                mark_unverified(entry, "member cannot be read as a regular file")
             continue
         if entry.data_offset + min(entry.usize, 8) > size:
+            if detect.extension_suggests_archive(entry.name):
+                mark_unverified(entry, "member data extends past the end of the file")
             continue
         examined += 1
-        head = read_at(fp, entry.data_offset, 16)
+        head = read_at(fp, entry.data_offset, 1024 if limits.verify else 16)
         if not detect.looks_like_archive(head, entry.name):
             continue
-        cap = min(entry.usize, limits.nested_prefix_bytes)
         if context.nested_archives >= limits.max_nested_archives:
             parent.notes.append("nested archive limit reached; stopping inspection")
+            if limits.verify:
+                parent.nested_unverified = True
             break
+        cap = min(entry.usize, capture_cap)
         if context.nested_used + cap > limits.nested_budget_bytes:
             parent.notes.append("nested inspection budget reached; stopping inspection")
+            if limits.verify:
+                parent.nested_unverified = True
             break
         data = read_at(fp, entry.data_offset, cap)
+        truncated = entry.usize > len(data)
+        if truncated:
+            mark_unverified(entry, "member exceeds the nested capture cap")
+        if not data:
+            continue
         context.spend(len(data))
-        truncated = entry.usize > cap
         child = _scan_bytes_nested(
             data,
             _nested_name(parent, entry.name),
@@ -599,10 +872,20 @@ def _inspect_compressed(
     depth: int,
 ) -> List[ScanResult]:
     limits = context.limits
+    capture_cap = (
+        limits.nested_capture_bytes
+        if limits.verify
+        else limits.nested_prefix_bytes
+    )
     remaining = limits.nested_budget_bytes - context.nested_used
     if remaining <= 0:
+        if limits.verify:
+            parent.nested_unverified = True
+            parent.notes.append(
+                "nested inspection budget exhausted; compressed content was not inspected"
+            )
         return []
-    cap = min(limits.nested_prefix_bytes, remaining)
+    cap = min(capture_cap, remaining)
     context.deadline.check()
     if fmt == "gzip":
         data = gzipfmt.decompress_prefix(fp, size, cap, context.deadline)
@@ -619,19 +902,29 @@ def _inspect_compressed(
         )
     if not data:
         return []
-    context.spend(len(data))
+    complete = len(data) < cap
     if context.nested_archives >= limits.max_nested_archives:
         parent.notes.append("nested archive limit reached; stopping inspection")
+        if limits.verify:
+            parent.nested_unverified = True
         return []
     if not detect.looks_like_archive(data[:1024], ""):
+        context.spend(len(data))
         return []
+    if limits.verify and not complete:
+        parent.nested_unverified = True
+        parent.notes.append(
+            "compressed member exceeds the nested capture cap; deeper content "
+            "was only partially inspected"
+        )
+    context.spend(len(data))
     return [
         _scan_bytes_nested(
             data,
             _nested_name(parent, "<decompressed>"),
             context,
             depth + 1,
-            truncated=len(data) >= cap,
+            truncated=(not complete) if limits.verify else len(data) >= cap,
         )
     ]
 
